@@ -2,9 +2,6 @@
 """
 import os
 import collections
-from contextlib import closing
-
-import pysam
 
 from bcbio.utils import file_exists
 from bcbio.distributed.transaction import file_transaction, tx_tmpdir
@@ -101,9 +98,10 @@ def picard_reorder(picard, in_bam, ref_file, out_file):
     if not file_exists(out_file):
         with tx_tmpdir(picard._config) as tmp_dir:
             with file_transaction(picard._config, out_file) as tx_out_file:
+                dict_file = "%s.dict" % os.path.splitext(ref_file)[0]
                 opts = [("INPUT", in_bam),
                         ("OUTPUT", tx_out_file),
-                        ("REFERENCE", ref_file),
+                        ("SEQUENCE_DICTIONARY", dict_file),
                         ("ALLOW_INCOMPLETE_DICT_CONCORDANCE", "true"),
                         ("TMP_DIR", tmp_dir)]
                 picard.run("ReorderSam", opts)
@@ -120,7 +118,7 @@ def picard_fix_rgs(picard, in_bam, names):
                         ("OUTPUT", tx_out_file),
                         ("SORT_ORDER", "coordinate"),
                         ("RGID", names["rg"]),
-                        ("RGLB", names.get("library", "unknown")),
+                        ("RGLB", names.get("lb", "unknown")),
                         ("RGPL", names["pl"]),
                         ("RGPU", names["pu"]),
                         ("RGSM", names["sample"]),
@@ -289,12 +287,12 @@ def bed2interval(align_file, bed, out_file=None):
     http://genome.ucsc.edu/FAQ/FAQformat.html#format1.5
 
     """
-
+    import pysam
     base, ext = os.path.splitext(align_file)
     if out_file is None:
         out_file = base + ".interval"
 
-    with closing(pysam.Samfile(align_file, "r" if ext.endswith(".sam") else "rb")) as in_bam:
+    with pysam.Samfile(align_file, "r" if ext.endswith(".sam") else "rb") as in_bam:
         header = in_bam.text
 
     def reorder_line(line):

@@ -1,205 +1,232 @@
 """Structural variation detection for split and paired reads using lumpy.
 
-Uses speedseq for lumpy integration and samblaster for read preparation:
-https://github.com/cc2qe/speedseq
-https://github.com/GregoryFaust/samblaster
+Uses smoove for automating lumpy variant calling:
+https://github.com/brentp/smoove
 https://github.com/arq5x/lumpy-sv
 """
-import operator
+import collections
 import os
-import sys
+import re
+import subprocess
 
-import toolz as tz
+import six
+import vcf
 
 from bcbio import utils
-from bcbio.distributed.transaction import file_transaction, tx_tmpdir
+from bcbio.bam import ref
+from bcbio.log import logger
+from bcbio.distributed.transaction import file_transaction
+from bcbio.heterogeneity import chromhacks
 from bcbio.pipeline import datadict as dd
+from bcbio.pipeline import config_utils
 from bcbio.provenance import do
 from bcbio.structural import shared as sshared
-from bcbio.variation import vcfutils
+from bcbio.variation import effects, vcfutils, vfilter
 
 # ## Lumpy main
 
-# Map from numbers used by speedseq to indicate paired and split read evidence
-SUPPORT_NUMS = {"1": "PE", "0": "SR"}
-
-def _run_lumpy(full_bams, sr_bams, disc_bams, work_dir, items):
-    """Run lumpy-sv, using speedseq pipeline.
+def _run_smoove(full_bams, sr_bams, disc_bams, work_dir, items):
+    """Run lumpy-sv using smoove.
     """
+    data = items[0]
     batch = sshared.get_cur_batch(items)
     ext = "-%s-svs" % batch if batch else "-svs"
-    out_file = os.path.join(work_dir, "%s%s.sv.bedpe"
-                            % (os.path.splitext(os.path.basename(items[0]["align_bam"]))[0], ext))
+    name = "%s%s" % (dd.get_sample_name(items[0]), ext)
+    out_file = os.path.join(work_dir, "%s-smoove.genotyped.vcf.gz" % name)
     sv_exclude_bed = sshared.prepare_exclude_file(items, out_file)
+    old_out_file = os.path.join(work_dir, "%s%s-prep.vcf.gz"
+                                % (os.path.splitext(os.path.basename(items[0]["align_bam"]))[0], ext))
+    if utils.file_exists(old_out_file):
+        return old_out_file, sv_exclude_bed
     if not utils.file_exists(out_file):
         with file_transaction(items[0], out_file) as tx_out_file:
-            with tx_tmpdir(items[0]) as tmpdir:
-                out_base = tx_out_file.replace(".sv.bedpe", "")
-                full_bams = ",".join(full_bams)
-                sr_bams = ",".join(sr_bams)
-                disc_bams = ",".join(disc_bams)
-                exclude = "-x %s" % sv_exclude_bed if sv_exclude_bed else ""
-                ref_file = dd.get_ref_file(items[0])
-                # use our bcbio python for runs within speedseq
-                curpython_dir = os.path.dirname(sys.executable)
-                cmd = ("export PATH={curpython_dir}:$PATH && "
-                       "speedseq sv -v -B {full_bams} -S {sr_bams} -D {disc_bams} -R {ref_file} "
-                       "{exclude} -A false -T {tmpdir} -o {out_base}")
-                do.run(cmd.format(**locals()), "speedseq lumpy", items[0])
+            cores = dd.get_num_cores(items[0])
+            out_dir = os.path.dirname(tx_out_file)
+            ref_file = dd.get_ref_file(items[0])
+            full_bams = " ".join(_prepare_smoove_bams(full_bams, sr_bams, disc_bams, items,
+                                                      os.path.dirname(tx_out_file)))
+            std_excludes = ["~^GL", "~^HLA", "~_random", "~^chrUn", "~alt", "~decoy"]
+            def _is_std_exclude(n):
+                clean_excludes = [x.replace("~", "").replace("^", "") for x in std_excludes]
+                return any([n.startswith(x) or n.endswith(x) for x in clean_excludes])
+            exclude_chrs = [c.name for c in ref.file_contigs(ref_file)
+                            if not chromhacks.is_nonalt(c.name) and not _is_std_exclude(c.name)]
+            exclude_chrs = "--excludechroms '%s'" % ",".join(std_excludes + exclude_chrs)
+            exclude_bed = ("--exclude %s" % sv_exclude_bed) if utils.file_exists(sv_exclude_bed) else ""
+            tempdir = os.path.dirname(tx_out_file)
+            smoove = config_utils.get_program("smoove", data)
+            smoovepath = os.path.dirname(smoove)
+            cmd = ("export TMPDIR={tempdir} && export PATH={smoovepath}:$PATH && "
+                   "{smoove} call --processes {cores} --genotype --removepr --fasta {ref_file} "
+                   "--name {name} --outdir {out_dir} "
+                   "{exclude_bed} {exclude_chrs} {full_bams}")
+            with utils.chdir(tempdir):
+                try:
+                    do.run(cmd.format(**locals()), "smoove lumpy calling", items[0])
+                except subprocess.CalledProcessError as msg:
+                    if _allowed_errors(msg):
+                        vcfutils.write_empty_vcf(tx_out_file, config=items[0]["config"],
+                                                 samples=[dd.get_sample_name(d) for d in items])
+                    else:
+                        logger.exception()
+                        raise
+    vcfutils.bgzip_and_index(out_file, items[0]["config"])
     return out_file, sv_exclude_bed
 
-def _get_support(parts):
-    """Retrieve supporting information for potentially multiple samples.
+def _prepare_smoove_bams(full_bams, sr_bams, disc_bams, items, tx_work_dir):
+    """Prepare BAMs for smoove, linking in pre-existing split/disc BAMs if present.
 
-    Convert speedseqs numbering scheme back into sample and support information.
-    sample_ids are generated like 20 or 21, where the first number is sample number
-    and the second is the type of supporting evidence.
+    Smoove can use pre-existing discordant and split BAMs prepared by samblaster
+    if present as $sample.split.bam and $sample.disc.bam.
     """
-    out = {}
-    for sample_id, read_count in (x.split(",") for x in parts[11].split(":")[-1].split(";")):
-        support_type = SUPPORT_NUMS[sample_id[-1]]
-        sample_id = int(sample_id[:-1]) - 1
-        out = tz.update_in(out, [sample_id, support_type], lambda x: x + int(read_count), 0)
+    input_dir = utils.safe_makedir(tx_work_dir)
+    out = []
+    for full, sr, disc, data in zip(full_bams, sr_bams, disc_bams, items):
+        if sr and disc:
+            new_full = os.path.join(input_dir, "%s.bam" % dd.get_sample_name(data))
+            new_sr = os.path.join(input_dir, "%s.split.bam" % dd.get_sample_name(data))
+            new_disc = os.path.join(input_dir, "%s.disc.bam" % dd.get_sample_name(data))
+            utils.symlink_plus(full, new_full)
+            utils.symlink_plus(sr, new_sr)
+            utils.symlink_plus(disc, new_disc)
+            out.append(new_full)
+        else:
+            out.append(full)
     return out
 
-def _subset_to_sample(orig_file, index, data):
-    """Subset population based calls to those supported within a single sample.
-    """
-    out_file = utils.append_stem(orig_file, "-" + data["rgnames"]["sample"])
-    if not utils.file_exists(out_file):
-        with file_transaction(data, out_file) as tx_out_file:
-            with open(orig_file) as in_handle:
-                with open(tx_out_file, "w") as out_handle:
-                    for parts in (l.rstrip().split("\t") for l in in_handle):
-                        support = _get_support(parts)
-                        if index in support:
-                            out_handle.write("\t".join(parts) + "\n")
-    return out_file
+def _allowed_errors(msg):
+    if six.PY3:
+        msg = str(msg)
+    else:
+        msg = unicode(msg).encode("ascii", "replace")
+    allowed = ["covmed: not enough reads to sample for bam stats",
+               "missing pair end parameters:",
+               "mean stdev read_length min_non_overlap"]
+    return any([len(re.findall(m, msg)) > 0 for m in allowed])
 
-def _filter_by_support(orig_file, index, data):
-    """Filter call file based on supporting evidence, adding pass/filter annotations to BEDPE.
+def _filter_by_support(in_file, data):
+    """Filter call file based on supporting evidence, adding FILTER annotations to VCF.
 
     Filters based on the following criteria:
-      - Minimum read support for the call.
-    Other filters not currently applied due to being too restrictive:
-      - Multiple forms of evidence in any sample (split and paired end)
+      - Minimum read support for the call (SU = total support)
+      - Large calls need split read evidence.
     """
-    min_read_count = 4
-    out_file = utils.append_stem(orig_file, "-filter")
-    if not utils.file_exists(out_file):
+    rc_filter = ("FORMAT/SU < 4 || "
+                 "(FORMAT/SR == 0 && FORMAT/SU < 15 && ABS(SVLEN)>50000) || "
+                 "(FORMAT/SR == 0 && FORMAT/SU < 5 && ABS(SVLEN)<2000) || "
+                 "(FORMAT/SR == 0 && FORMAT/SU < 15 && ABS(SVLEN)<300)")
+    return vfilter.cutoff_w_expression(in_file, rc_filter, data, name="ReadCountSupport",
+                                       limit_regions=None)
+
+def _filter_by_background(base_name, back_samples, gt_vcfs, data):
+    """Filter base samples, marking any also present in the background.
+    """
+    filtname = "InBackground"
+    filtdoc = "Variant also present in background samples with same genotype"
+    orig_vcf = gt_vcfs[base_name]
+    out_file = "%s-backfilter.vcf" % (utils.splitext_plus(orig_vcf)[0])
+    if not utils.file_exists(out_file) and not utils.file_exists(out_file + ".gz"):
         with file_transaction(data, out_file) as tx_out_file:
-            with open(orig_file) as in_handle:
+            with utils.open_gzipsafe(orig_vcf) as in_handle:
+                inp = vcf.Reader(in_handle, orig_vcf)
+                inp.filters[filtname] = vcf.parser._Filter(filtname, filtdoc)
                 with open(tx_out_file, "w") as out_handle:
-                    for parts in (l.rstrip().split("\t") for l in in_handle):
-                        support = _get_support(parts)
-                        #evidence = set(reduce(operator.add, [x.keys() for x in support.values()]))
-                        read_count = reduce(operator.add, support[index].values())
-                        if read_count < min_read_count:
-                            lfilter = "ReadCountSupport"
-                        #elif len(evidence) < 2:
-                        #    lfilter = "ApproachSupport"
-                        else:
-                            lfilter = "PASS"
-                        parts.append(lfilter)
-                        out_handle.write("\t".join(parts) + "\n")
-    return out_file
+                    outp = vcf.Writer(out_handle, inp)
+                    for rec in inp:
+                        if _genotype_in_background(rec, base_name, back_samples):
+                            rec.add_filter(filtname)
+                        outp.write_record(rec)
+    if utils.file_exists(out_file + ".gz"):
+        out_file = out_file + ".gz"
+    gt_vcfs[base_name] = vcfutils.bgzip_and_index(out_file, data["config"])
+    return gt_vcfs
 
-def _write_samples_to_ids(base_file, items):
-    """Write BED file mapping samples to IDs used in the lumpy bedpe output.
+def _genotype_in_background(rec, base_name, back_samples):
+    """Check if the genotype in the record of interest is present in the background records.
     """
-    out_file = "%s-samples.bed" % utils.splitext_plus(base_file)[0]
-    if not utils.file_exists(out_file):
-        with file_transaction(items[0], out_file) as tx_out_file:
-            with open(tx_out_file, "w") as out_handle:
-                for i, data in enumerate(items):
-                    sample = tz.get_in(["rgnames", "sample"], data)
-                    for sid, stype in SUPPORT_NUMS.items():
-                        sample_id = "%s%s" % (i + 1, sid)
-                        out_handle.write("%s\t%s\t%s\n" % (sample, sample_id, stype))
-    return out_file
+    def passes(rec):
+        return not rec.FILTER or len(rec.FILTER) == 0
+    return (passes(rec) and
+            any(rec.genotype(base_name).gt_alleles == rec.genotype(back_name).gt_alleles
+                for back_name in back_samples))
 
-def _bedpe_to_vcf(bedpe_file, sconfig_file, items):
-    """Convert BEDPE output into a VCF file.
-    """
-    tovcf_script = do.find_cmd("bedpeToVcf")
-    if tovcf_script:
-        out_file = "%s.vcf.gz" % utils.splitext_plus(bedpe_file)[0]
-        out_nogzip = out_file.replace(".vcf.gz", ".vcf")
-        raw_file = "%s-raw.vcf" % utils.splitext_plus(bedpe_file)[0]
-        if not utils.file_exists(out_file):
-            if not utils.file_exists(raw_file):
-                with file_transaction(items[0], raw_file) as tx_raw_file:
-                    cmd = [sys.executable, tovcf_script, "-c", sconfig_file, "-f", dd.get_ref_file(items[0]),
-                           "-t", "LUMPY", "-b", bedpe_file, "-o", tx_raw_file]
-                    do.run(cmd, "Convert lumpy bedpe output to VCF")
-            prep_file = vcfutils.sort_by_ref(raw_file, items[0])
-            if not utils.file_exists(out_nogzip):
-                utils.symlink_plus(prep_file, out_nogzip)
-        out_file = vcfutils.bgzip_and_index(out_nogzip, items[0]["config"])
-        return out_file
-
-def _filter_by_bedpe(vcf_file, bedpe_file, data):
-    """Add filters to VCF based on pre-filtered bedpe file.
-    """
-    out_file = "%s-filter%s" % utils.splitext_plus(vcf_file)
-    nogzip_out_file = out_file.replace(".vcf.gz", ".vcf")
-    if not utils.file_exists(out_file):
-        filters = {}
-        with open(bedpe_file) as in_handle:
-            for line in in_handle:
-                parts = line.split("\t")
-                name = parts[6]
-                cur_filter = parts[-1].strip()
-                if cur_filter != "PASS":
-                    filters[name] = cur_filter
-        with file_transaction(data, nogzip_out_file) as tx_out_file:
-            with open(tx_out_file, "w") as out_handle:
-                with utils.open_gzipsafe(vcf_file) as in_handle:
-                    for line in in_handle:
-                        if not line.startswith("#"):
-                            parts = line.split("\t")
-                            cur_id = parts[2].split("_")[0]
-                            cur_filter = filters.get(cur_id, "PASS")
-                            if cur_filter != "PASS":
-                                parts[6] = cur_filter
-                            line = "\t".join(parts)
-                        out_handle.write(line)
-        if out_file.endswith(".gz"):
-            vcfutils.bgzip_and_index(nogzip_out_file, data["config"])
-    return out_file
+def _sv_workdir(data):
+    return utils.safe_makedir(os.path.join(data["dirs"]["work"], "structural",
+                                           dd.get_sample_name(data), "lumpy"))
 
 def run(items):
-    """Perform detection of structural variations with lumpy, using bwa-mem alignment.
+    """Perform detection of structural variations with lumpy.
     """
-    if not all(utils.get_in(data, ("config", "algorithm", "aligner")) == "bwa" for data in items):
-        raise ValueError("Require bwa-mem alignment input for lumpy structural variation detection")
-    work_dir = utils.safe_makedir(os.path.join(items[0]["dirs"]["work"], "structural", items[0]["name"][-1],
-                                               "lumpy"))
+    paired = vcfutils.get_paired(items)
+    work_dir = _sv_workdir(paired.tumor_data if paired and paired.tumor_data else items[0])
+    previous_evidence = {}
     full_bams, sr_bams, disc_bams = [], [], []
     for data in items:
-        dedup_bam, sr_bam, disc_bam = sshared.get_split_discordants(data, work_dir)
-        full_bams.append(dedup_bam)
+        full_bams.append(dd.get_align_bam(data))
+        sr_bam, disc_bam = sshared.find_existing_split_discordants(data)
         sr_bams.append(sr_bam)
         disc_bams.append(disc_bam)
-    pebed_file, exclude_file = _run_lumpy(full_bams, sr_bams, disc_bams, work_dir, items)
+        cur_dels, cur_dups = _bedpes_from_cnv_caller(data, work_dir)
+        previous_evidence[dd.get_sample_name(data)] = {}
+        if cur_dels and utils.file_exists(cur_dels):
+            previous_evidence[dd.get_sample_name(data)]["dels"] = cur_dels
+        if cur_dups and utils.file_exists(cur_dups):
+            previous_evidence[dd.get_sample_name(data)]["dups"] = cur_dups
+    lumpy_vcf, exclude_file = _run_smoove(full_bams, sr_bams, disc_bams, work_dir, items)
+    lumpy_vcf = sshared.annotate_with_depth(lumpy_vcf, items)
+    gt_vcfs = {}
+    # Retain paired samples with tumor/normal genotyped in one file
+    if paired and paired.normal_name:
+        batches = [[paired.tumor_data, paired.normal_data]]
+    else:
+        batches = [[x] for x in items]
+
+    for batch_items in batches:
+        for data in batch_items:
+            gt_vcfs[dd.get_sample_name(data)] = _filter_by_support(lumpy_vcf, data)
+    if paired and paired.normal_name:
+        gt_vcfs = _filter_by_background(paired.tumor_name, [paired.normal_name], gt_vcfs, paired.tumor_data)
     out = []
-    sample_config_file = _write_samples_to_ids(pebed_file, items)
-    lumpy_vcf = _bedpe_to_vcf(pebed_file, sample_config_file, items)
-    for i, data in enumerate(items):
+    upload_counts = collections.defaultdict(int)
+    for data in items:
         if "sv" not in data:
             data["sv"] = []
-        sample = tz.get_in(["rgnames", "sample"], data)
-        sample_bedpe = _filter_by_support(_subset_to_sample(pebed_file, i, data), i, data)
-        if lumpy_vcf:
-            sample_vcf = utils.append_stem(lumpy_vcf, "-%s" % sample)
-            sample_vcf = _filter_by_bedpe(vcfutils.select_sample(lumpy_vcf, sample, sample_vcf, data["config"]),
-                                          sample_bedpe, data)
-        else:
-            sample_vcf = None
-        data["sv"].append({"variantcaller": "lumpy",
-                           "vrn_file": sample_vcf,
-                           "exclude_file": exclude_file,
-                           "bedpe_file": sample_bedpe,
-                           "sample_bed": sample_config_file})
+        vcf_file = gt_vcfs.get(dd.get_sample_name(data))
+        if vcf_file:
+            effects_vcf, _ = effects.add_to_vcf(vcf_file, data, "snpeff")
+            data["sv"].append({"variantcaller": "lumpy",
+                               "vrn_file": effects_vcf or vcf_file,
+                               "do_upload": upload_counts[vcf_file] == 0,  # only upload a single file per batch
+                               "exclude_file": exclude_file})
+            upload_counts[vcf_file] += 1
         out.append(data)
     return out
+
+def _bedpes_from_cnv_caller(data, work_dir):
+    """Retrieve BEDPEs deletion and duplications from CNV callers.
+
+    Currently integrates with CNVkit.
+    """
+    supported = set(["cnvkit"])
+    cns_file = None
+    for sv in data.get("sv", []):
+        if sv["variantcaller"] in supported and "cns" in sv and "lumpy_usecnv" in dd.get_tools_on(data):
+            cns_file = sv["cns"]
+            break
+    if not cns_file:
+        return None, None
+    else:
+        out_base = os.path.join(work_dir, utils.splitext_plus(os.path.basename(cns_file))[0])
+        out_dels = out_base + "-dels.bedpe"
+        out_dups = out_base + "-dups.bedpe"
+        if not os.path.exists(out_dels) or not os.path.exists(out_dups):
+            with file_transaction(data, out_dels, out_dups) as (tx_out_dels, tx_out_dups):
+                try:
+                    cnvanator_path = config_utils.get_program("cnvanator_to_bedpes.py", data)
+                except config_utils.CmdNotFound:
+                    return None, None
+                cmd = [cnvanator_path, "-c", cns_file, "--cnvkit",
+                        "--del_o=%s" % tx_out_dels, "--dup_o=%s" % tx_out_dups,
+                        "-b", "250"]  # XXX Uses default piece size for CNVkit. Right approach?
+                do.run(cmd, "Prepare CNVkit as input for lumpy", data)
+        return out_dels, out_dups

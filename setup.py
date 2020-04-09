@@ -1,48 +1,28 @@
 #!/usr/bin/env python
-"""Setup file and install script for NextGen sequencing analysis scripts.
-"""
-import sys
+
+"""Setup file and install script for NextGen sequencing analysis scripts"""
+
 import os
-from setuptools import setup, find_packages
+import subprocess
 
-version = "0.8.3a"
+import setuptools
 
-def write_version_py():
-    version_py = os.path.join(os.path.dirname(__file__), 'bcbio', 'pipeline',
-                              'version.py')
-    try:
-        import subprocess
-        p = subprocess.Popen(["git", "rev-parse", "--short", "HEAD"],
-                             stdout=subprocess.PIPE)
-        githash = p.stdout.read().strip()
-    except:
-        githash = ""
-    with open(version_py, "w") as out_handle:
-        out_handle.write("\n".join(['__version__ = "%s"' % version,
-                                    '__git_revision__ = "%s"' % githash]))
+VERSION = '1.2.3'
 
-with open("requirements.txt", "r") as f:
-    install_requires = [x.strip() for x in f.readlines() if not x.startswith(("bcbio-nextgen", "#"))]
-
-# library-only install: enable skipping of scripts and requirements for conda builds
-if "--record=/dev/null" in sys.argv:
-    scripts = []
-    install_requires = []
-    zip_safe = True
+# add bcbio version number and git commit hash of the current revision to version.py
+try:
+    git_run = subprocess.run(['git', 'rev-parse', '--short', 'HEAD'], stdout=subprocess.PIPE)
+    git_run.check_returncode()
+except subprocess.SubprocessError:
+    commit_hash = ''
 else:
-    zip_safe = False
-    scripts = ['scripts/bcbio_nextgen.py', 'scripts/bcbio_setup_genome.py']
+    commit_hash = git_run.stdout.strip().decode()
 
-write_version_py()
-setup(name="bcbio-nextgen",
-      version=version,
-      author="Brad Chapman and bcbio-nextgen contributors",
-      author_email="chapmanb@50mail.com",
-      description="Best-practice pipelines for fully automated high throughput sequencing analysis",
-      long_description=(open('README.rst').read()),
-      license="MIT",
-      url="https://github.com/chapmanb/bcbio-nextgen",
-      packages=find_packages(),
-      zip_safe=zip_safe,
-      scripts=scripts,
-      install_requires=install_requires)
+here = os.path.dirname(os.path.abspath(__file__))
+with open(os.path.join(here, 'bcbio', 'pipeline', 'version.py'), 'w') as version_file:
+    version_file.writelines([f'__version__ = "{VERSION}"\n',
+                             f'__git_revision__ = "{commit_hash}"\n'])
+
+# dependencies are installed via Conda from
+# https://github.com/chapmanb/cloudbiolinux/blob/master/contrib/flavor/ngs_pipeline_minimal/packages-conda.yaml
+setuptools.setup(version=VERSION)

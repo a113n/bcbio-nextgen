@@ -3,17 +3,20 @@
 http://cufflinks.cbcb.umd.edu/manual.html
 """
 import os
+import shutil
 import tempfile
-
+import pandas as pd
+from bcbio import bam
 from bcbio.utils import get_in, file_exists, safe_makedir
 from bcbio.distributed.transaction import file_transaction
+from bcbio.log import logger
 from bcbio.pipeline import config_utils
 from bcbio.provenance import do
 from bcbio.rnaseq import gtf, annotate_gtf
-import pandas as pd
 
 
 def run(align_file, ref_file, data):
+    align_file = bam.convert_cufflinks_mapq(align_file)
     config = data["config"]
     cmd = _get_general_options(align_file, config)
     cmd.extend(_get_no_assembly_options(ref_file, data))
@@ -24,13 +27,15 @@ def run(align_file, ref_file, data):
     fpkm_file_isoform = os.path.join(out_dir, data['rgnames']['sample']) + ".isoform.fpkm"
     if not file_exists(fpkm_file):
         with file_transaction(data, out_dir) as tmp_out_dir:
+            safe_makedir(tmp_out_dir)
             cmd.extend(["--output-dir", tmp_out_dir])
             cmd.extend([align_file])
-            cmd = map(str, cmd)
+            cmd = list(map(str, cmd))
             do.run(cmd, "Cufflinks on %s." % (align_file))
         fpkm_file = gene_tracking_to_fpkm(tracking_file, fpkm_file)
         fpkm_file_isoform = gene_tracking_to_fpkm(tracking_file_isoform, fpkm_file_isoform)
     return out_dir, fpkm_file, fpkm_file_isoform
+
 
 def gene_tracking_to_fpkm(tracking_file, out_file):
     """
@@ -41,11 +46,12 @@ def gene_tracking_to_fpkm(tracking_file, out_file):
     """
     if file_exists(out_file):
         return out_file
-    df = pd.io.parsers.read_table(tracking_file, sep="\t", header=0)
+    df = pd.io.parsers.read_csv(tracking_file, sep="\t", header=0)
     df = df[['tracking_id', 'FPKM']]
     df = df.groupby(['tracking_id']).sum()
     df.to_csv(out_file, sep="\t", header=False, index_label=False)
     return out_file
+
 
 def _get_general_options(align_file, config):
     options = []
@@ -57,6 +63,7 @@ def _get_general_options(align_file, config):
     options.extend(["--max-bundle-frags", 2000000])
     options.extend(_get_stranded_flag(config))
     return options
+
 
 def _get_no_assembly_options(ref_file, data):
     options = []
@@ -71,6 +78,7 @@ def _get_no_assembly_options(ref_file, data):
         options.extend(["--mask-file", mask_file])
 
     return options
+
 
 def _get_stranded_flag(config):
     strand_flag = {"unstranded": "fr-unstranded",
@@ -89,19 +97,26 @@ def _get_output_dir(align_file, data, sample_dir=True):
     name = data["rgnames"]["sample"] if sample_dir else ""
     return os.path.join(get_in(data, ("dirs", "work")), "cufflinks", name)
 
+
 def assemble(bam_file, ref_file, num_cores, out_dir, data):
     out_dir = os.path.join(out_dir, data["rgnames"]["sample"])
     safe_makedir(out_dir)
-    out_file = os.path.join(out_dir, data["rgnames"]["sample"], "transcripts.gtf")
+    out_file = os.path.join(out_dir, "cufflinks-assembly.gtf")
+    cufflinks_out_file = os.path.join(out_dir, "transcripts.gtf")
+    library_type = " ".join(_get_stranded_flag(data["config"]))
     if file_exists(out_file):
         return out_file
+    bam_file = bam.convert_cufflinks_mapq(bam_file)
     with file_transaction(data, out_dir) as tmp_out_dir:
         cmd = ("cufflinks --output-dir {tmp_out_dir} --num-threads {num_cores} "
                "--frag-bias-correct {ref_file} "
-               "--multi-read-correct --upper-quartile-norm {bam_file}")
+               "--quiet " 
+               "{library_type} --multi-read-correct --upper-quartile-norm {bam_file}")
         cmd = cmd.format(**locals())
         do.run(cmd, "Assembling transcripts with Cufflinks using %s." % bam_file)
+    shutil.move(cufflinks_out_file, out_file)
     return out_file
+
 
 def clean_assembly(gtf_file, clean=None, dirty=None):
     """
@@ -115,6 +130,7 @@ def clean_assembly(gtf_file, clean=None, dirty=None):
     dirty = dirty if dirty else base + ".dirty" + ext
     if file_exists(clean):
         return clean, dirty
+    logger.info("Cleaning features with an unknown strand from the assembly.")
     with open(clean, "w") as clean_handle, open(dirty, "w") as dirty_handle:
         for gene in db.features_of_type('gene'):
             for transcript in db.children(gene, level=1):
@@ -124,15 +140,18 @@ def clean_assembly(gtf_file, clean=None, dirty=None):
                     write_transcript(db, clean_handle, transcript)
     return clean, dirty
 
+
 def write_transcript(db, handle, transcript):
     for feature in db.children(transcript):
         handle.write(str(feature) + "\n")
+
 
 def is_likely_noise(db, transcript):
     if is_novel_single_exon(db, transcript):
         return True
     if strand_unknown(db, transcript):
         return True
+
 
 def strand_unknown(db, transcript):
     """
@@ -147,6 +166,7 @@ def strand_unknown(db, transcript):
     else:
         return False
 
+
 def is_novel_single_exon(db, transcript):
     features = list(db.children(transcript))
     exons = [x for x in features if x.featuretype == "exon"]
@@ -155,18 +175,19 @@ def is_novel_single_exon(db, transcript):
         return True
     return False
 
+
 def fix_cufflinks_attributes(ref_gtf, merged_gtf, data, out_file=None):
     """
     replace the cufflinks gene_id and transcript_id with the
     gene_id and transcript_id from ref_gtf, where available
 
     """
-    ref_db = gtf.get_gtf_db(ref_gtf, in_memory=True)
-    merged_db = gtf.get_gtf_db(merged_gtf, in_memory=True)
     base, ext = os.path.splitext(merged_gtf)
     fixed = out_file if out_file else base + ".clean.fixed" + ext
     if file_exists(fixed):
         return fixed
+    ref_db = gtf.get_gtf_db(ref_gtf)
+    merged_db = gtf.get_gtf_db(merged_gtf, in_memory=True)
 
     ref_tid_to_gid = {}
     for gene in ref_db.features_of_type('gene'):
@@ -212,6 +233,7 @@ def fix_cufflinks_attributes(ref_gtf, merged_gtf, data, out_file=None):
                         out_handle.write(str(feature) + "\n")
     return fixed
 
+
 def merge(assembled_gtfs, ref_file, gtf_file, num_cores, data):
     """
     run cuffmerge on a set of assembled GTF files
@@ -225,15 +247,19 @@ def merge(assembled_gtfs, ref_file, gtf_file, num_cores, data):
     out_file = os.path.join(out_dir, "assembled.gtf")
     if file_exists(out_file):
         return out_file
-    with file_transaction(data, out_dir) as tmp_out_dir:
-        cmd = ("cuffmerge -o {tmp_out_dir} --ref-gtf {gtf_file} "
-               "--num-threads {num_cores} --ref-sequence {ref_file} "
-               "{assembled_file}")
-        cmd = cmd.format(**locals())
-        do.run(cmd, "Merging transcript assemblies with reference.")
+    if not file_exists(merged_file):
+        with file_transaction(data, out_dir) as tmp_out_dir:
+            cmd = ("cuffmerge -o {tmp_out_dir} --ref-gtf {gtf_file} "
+                   "--num-threads {num_cores} --ref-sequence {ref_file} "
+                   "{assembled_file}")
+            cmd = cmd.format(**locals())
+            message = ("Merging the following transcript assemblies with "
+                       "Cuffmerge: %s" % ", ".join(assembled_gtfs))
+            do.run(cmd, message)
     clean, _ = clean_assembly(merged_file)
     fixed = fix_cufflinks_attributes(gtf_file, clean, data)
-    classified = annotate_gtf.annotate_novel_coding(fixed, gtf_file, ref_file)
+    classified = annotate_gtf.annotate_novel_coding(fixed, gtf_file, ref_file,
+                                                    data)
     filtered = annotate_gtf.cleanup_transcripts(classified, gtf_file, ref_file)
-    os.rename(filtered, out_file)
+    shutil.move(filtered, out_file)
     return out_file

@@ -65,7 +65,7 @@ class PicardMetricsParser(object):
                 parse_fn = None
             if parse_fn:
                 with open(fname) as in_handle:
-                    for key, val in parse_fn(in_handle).iteritems():
+                    for key, val in parse_fn(in_handle).items():
                         if not key.startswith(prefix):
                             key = "%s_%s" % (prefix, key)
                         all_metrics[key] = val
@@ -220,7 +220,7 @@ class PicardMetricsParser(object):
             vals = self._read_vals_of_interest(want_stats, header, info)
             if info[0].lower() == "pair":
                 new_vals = dict()
-                for item, val in vals.iteritems():
+                for item, val in vals.items():
                     if item in half_stats:
                         new_vals[item] = str(int(val) // 2)
                     else:
@@ -324,7 +324,7 @@ class PicardMetrics(object):
         metrics_file = "%s.dup_metrics" % os.path.splitext(align_bam)[0]
         if not file_exists(metrics_file):
             dups = 0
-            with contextlib.closing(pysam.Samfile(align_bam, "rb")) as bam_handle:
+            with pysam.Samfile(align_bam, "rb") as bam_handle:
                 for read in bam_handle:
                     if (read.is_paired and read.is_read1) or not read.is_paired:
                         if read.is_duplicate:
@@ -364,7 +364,7 @@ class PicardMetrics(object):
                                 ("INPUT", dup_bam),
                                 ("OUTPUT", tx_metrics)]
                         try:
-                            self._picard.run("CalculateHsMetrics", opts)
+                            self._picard.run("CollectHsMetrics", opts)
                         # HsMetrics fails regularly with memory errors
                         # so we catch and skip instead of aborting the
                         # full process
@@ -445,19 +445,23 @@ def bed_to_interval(orig_bed, bam_file):
     if line.startswith("@"):
         yield orig_bed
     else:
-        bam_handle = pysam.Samfile(bam_file, "rb")
-        with contextlib.closing(bam_handle):
+        with pysam.Samfile(bam_file, "rb") as bam_handle:
             header = bam_handle.text
         with tmpfile(dir=os.path.dirname(orig_bed), prefix="picardbed") as tmp_bed:
             with open(tmp_bed, "w") as out_handle:
                 out_handle.write(header)
                 with open(orig_bed) as in_handle:
-                    for line in in_handle:
+                    for i, line in enumerate(in_handle):
                         parts = line.rstrip().split("\t")
-                        if len(parts) == 3:
-                            parts.append("+")
-                            parts.append("a")
-                        out_handle.write("\t".join(parts) + "\n")
+                        if len(parts) == 4:
+                            chrom, start, end, name = parts
+                            strand = "+"
+                        elif len(parts) >= 3:
+                            chrom, start, end = parts[:3]
+                            strand = "+"
+                            name = "r%s" % i
+                        out = [chrom, start, end, strand, name]
+                        out_handle.write("\t".join(out) + "\n")
             yield tmp_bed
 
 

@@ -20,8 +20,8 @@ def runner(parallel, config):
         if len(items) == 0:
             return []
         items = diagnostics.track_parallel(items, fn_name)
+        fn, fn_name = (fn_name, fn_name.__name__) if callable(fn_name) else (get_fn(fn_name, parallel), fn_name)
         logger.info("multiprocessing: %s" % fn_name)
-        fn = get_fn(fn_name, parallel)
         if "wrapper" in parallel:
             wrap_parallel = {k: v for k, v in parallel.items() if k in set(["fresources", "checkpointed"])}
             items = [[fn_name] + parallel.get("wrapper_args", []) + [wrap_parallel] + list(x) for x in items]
@@ -70,6 +70,8 @@ def zeromq_aware_logging(f):
 def run_multicore(fn, items, config, parallel=None):
     """Run the function using multiple cores on the given items to process.
     """
+    if len(items) == 0:
+        return []
     if parallel is None or "num_jobs" not in parallel:
         if parallel is None:
             parallel = {"type": "local", "cores": config["algorithm"].get("num_cores", 1)}
@@ -81,7 +83,7 @@ def run_multicore(fn, items, config, parallel=None):
     if joblib is None:
         raise ImportError("Need joblib for multiprocessing parallelization")
     out = []
-    for data in joblib.Parallel(parallel["num_jobs"])(joblib.delayed(fn)(x) for x in items):
+    for data in joblib.Parallel(parallel["num_jobs"], batch_size=1, backend="multiprocessing")(joblib.delayed(fn)(*x) for x in items):
         if data:
             out.extend(data)
     return out

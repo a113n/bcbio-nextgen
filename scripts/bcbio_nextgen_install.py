@@ -5,8 +5,9 @@ This automates the steps required for installation and setup to make it
 easier to get started with bcbio-nextgen. The defaults provide data files
 for human variant calling.
 
-Requires: git, Python 2.7 or argparse for earlier versions.
+Requires: git, wget, bgzip2, Python 3.x, Python 2.7 or argparse + Python 2.6 and earlier
 """
+from __future__ import print_function
 import collections
 import contextlib
 import datetime
@@ -15,30 +16,37 @@ import platform
 import shutil
 import subprocess
 import sys
-import urllib2
+try:
+    import urllib2 as urllib_request
+except ImportError:
+    import urllib.request as urllib_request
 
-remotes = {"requirements":
-           "https://raw.github.com/chapmanb/bcbio-nextgen/master/requirements.txt",
-           "gitrepo": "git://github.com/chapmanb/bcbio-nextgen.git",
-           "system_config":
-           "https://raw.github.com/chapmanb/bcbio-nextgen/master/config/bcbio_system.yaml",
-           "anaconda":
-           "http://repo.continuum.io/miniconda/Miniconda-3.5.5-%s-x86_64.sh"}
+REMOTES = {
+    "requirements": "https://raw.githubusercontent.com/bcbio/bcbio-nextgen/master/requirements-conda.txt",
+    "gitrepo": "https://github.com/bcbio/bcbio-nextgen.git",
+    "system_config": "https://raw.githubusercontent.com/bcbio/bcbio-nextgen/master/config/bcbio_system.yaml",
+    "anaconda": "https://repo.continuum.io/miniconda/Miniconda3-latest-%s-x86_64.sh"}
+TARGETPY = "python=3.6"
 
 def main(args, sys_argv):
+    check_arguments(args)
     check_dependencies()
     with bcbio_tmpdir():
         setup_data_dir(args)
         print("Installing isolated base python installation")
-        anaconda = install_anaconda_python(args, remotes)
+        anaconda = install_anaconda_python(args)
+        print("Installing mamba")
+        anaconda = install_mamba(anaconda, args)
+        print("Installing conda-build")
+        install_conda_build(anaconda, args)
         print("Installing bcbio-nextgen")
-        install_conda_pkgs(anaconda)
-        bcbio = bootstrap_bcbionextgen(anaconda, args, remotes)
+        bcbio = install_conda_pkgs(anaconda, args)
+        bootstrap_bcbionextgen(anaconda, args)
     print("Installing data and third party dependencies")
-    system_config = write_system_config(remotes["system_config"], args.datadir,
+    system_config = write_system_config(REMOTES["system_config"], args.datadir,
                                         args.tooldir)
     setup_manifest(args.datadir)
-    subprocess.check_call([bcbio["bcbio_nextgen.py"], "upgrade"] + _clean_args(sys_argv, args, bcbio))
+    subprocess.check_call([bcbio, "upgrade"] + _clean_args(sys_argv, args))
     print("Finished: bcbio-nextgen, tools and data installed")
     print(" Genome data installed in:\n  %s" % args.datadir)
     if args.tooldir:
@@ -46,53 +54,86 @@ def main(args, sys_argv):
     print(" Ready to use system configuration at:\n  %s" % system_config)
     print(" Edit configuration file as needed to match your machine or cluster")
 
-def _clean_args(sys_argv, args, bcbio):
+def _clean_args(sys_argv, args):
     """Remove data directory from arguments to pass to upgrade function.
     """
     base = [x for x in sys_argv if
             x.startswith("-") or not args.datadir == os.path.abspath(os.path.expanduser(x))]
-    # specification of data argument changes in install (default data) to upgrade (default nodata)
-    # in bcbio_nextgen 0.7.5 and beyond
-    process = subprocess.Popen([bcbio["bcbio_nextgen.py"], "--version"], stdout=subprocess.PIPE)
-    version, _ = process.communicate()
-    if version.strip() > "0.7.4":
-        if "--nodata" in base:
-            base.remove("--nodata")
-        else:
-            base.append("--data")
+    # Remove installer only options we don't pass on
+    base = [x for x in base if x not in set(["--minimize-disk"])]
+    if "--nodata" in base:
+        base.remove("--nodata")
+    else:
+        base.append("--data")
     return base
 
-def bootstrap_bcbionextgen(anaconda, args, remotes):
-    """Install bcbio-nextgen to bootstrap rest of installation process.
-    """
-    subprocess.check_call([anaconda["pip"], "install", "fabric"])
-    subprocess.check_call([anaconda["pip"], "install", "-r", remotes["requirements"]])
+def bootstrap_bcbionextgen(anaconda, args):
     if args.upgrade == "development":
+        git_tag = "@%s" % args.revision if args.revision != "master" else ""
         subprocess.check_call([anaconda["pip"], "install", "--upgrade", "--no-deps",
-                               "git+%s#egg=bcbio-nextgen" % remotes["gitrepo"]])
-    out = {}
-    for script in ["bcbio_nextgen.py"]:
-        ve_script = os.path.join(anaconda["dir"], "bin", script)
-        if args.tooldir:
-            final_script = os.path.join(args.tooldir, "bin", script)
-            sudo_cmd = ["sudo"] if args.sudo else []
-            subprocess.check_call(sudo_cmd + ["mkdir", "-p", os.path.dirname(final_script)])
-            if os.path.lexists(final_script):
-                cmd = ["rm", "-f", final_script]
-                subprocess.check_call(sudo_cmd + cmd)
-            cmd = ["ln", "-s", ve_script, final_script]
-            subprocess.check_call(sudo_cmd + cmd)
-        out[script] = ve_script
+                               "git+%s%s#egg=bcbio-nextgen" % (REMOTES["gitrepo"], git_tag)])
+
+def _get_conda_channels(conda_bin):
+    """Retrieve default conda channels, checking if they are pre-specified in config.
+
+    This allows users to override defaults with specific mirrors in their .condarc
+    """
+    channels = ["bioconda", "conda-forge"]
+    out = []
+    try:
+        import yaml
+        config = yaml.safe_load(subprocess.check_output([conda_bin, "config", "--show"]))
+    except ImportError:
+        config = {}
+    for c in channels:
+        present = False
+        for orig_c in config.get("channels") or []:
+            if orig_c.endswith((c, "%s/" % c)):
+                present = True
+                break
+        if not present:
+            out += ["-c", c]
     return out
 
-def install_conda_pkgs(anaconda):
-    pkgs = ["biopython", "boto", "cnvkit", "cpat", "cython", "ipython", "lxml",
-            "matplotlib", "msgpack-python", "nose", "numpy", "pandas", "patsy", "pycrypto",
-            "pip", "pysam", "pyvcf", "pyyaml", "pyzmq", "reportlab", "requests", "scikit-learn",
-            "scipy", "setuptools", "sqlalchemy", "statsmodels", "toolz", "tornado"]
-    channels = ["-c", "https://conda.binstar.org/bcbio"]
-    subprocess.check_call([anaconda["conda"], "install", "--yes", "numpy"])
-    subprocess.check_call([anaconda["conda"], "install", "--yes"] + channels + pkgs)
+def install_mamba(anaconda, args):
+    anaconda_dir = os.path.join(args.datadir, "anaconda")
+    bindir = os.path.join(anaconda_dir, "bin")
+    mamba = os.path.join(bindir, "mamba")
+    subprocess.check_call(
+        [anaconda["conda"], "install", "--yes"] +
+        _get_conda_channels(anaconda["conda"]) + ["mamba"])
+    anaconda["mamba"] = mamba
+    return anaconda
+
+def install_conda_build(anaconda, args):
+    anaconda_dir = os.path.join(args.datadir, "anaconda")
+    bindir = os.path.join(anaconda_dir, "bin")
+    mamba = os.path.join(bindir, "mamba")
+    subprocess.check_call(
+        [anaconda["mamba"], "install", "--yes"] +
+        _get_conda_channels(anaconda["conda"]) + ["conda-build"])
+
+def install_conda_pkgs(anaconda, args):
+    env = dict(os.environ)
+    # Try to avoid user specific pkgs and envs directories
+    # https://github.com/conda/conda/issues/6748
+    env["CONDA_PKGS_DIRS"] = os.path.join(anaconda["dir"], "pkgs")
+    env["CONDA_ENVS_DIRS"] = os.path.join(anaconda["dir"], "envs")
+    conda_bin = anaconda["conda"]
+    if "mamba" in anaconda.keys():
+      mamba_bin = anaconda["mamba"]
+    else:
+      mamba_bin = anaconda["conda"]
+    if not os.path.exists(os.path.basename(REMOTES["requirements"])):
+        subprocess.check_call(["wget", "--no-check-certificate", REMOTES["requirements"]])
+    if args.minimize_disk:
+        subprocess.check_call([mamba_bin, "install", "--yes", "nomkl"], env=env)
+    channels = _get_conda_channels(conda_bin)
+    subprocess.check_call([mamba_bin, "install", "--yes"] + channels +
+                          ["--only-deps", "bcbio-nextgen", TARGETPY], env=env)
+    subprocess.check_call([conda_bin, "install", "--yes"] + channels +
+                          ["--file", os.path.basename(REMOTES["requirements"]), TARGETPY], env=env)
+    return os.path.join(anaconda["dir"], "bin", "bcbio_nextgen.py")
 
 def _guess_distribution():
     """Simple approach to identify if we are on a MacOSX or Linux system for Anaconda.
@@ -102,7 +143,7 @@ def _guess_distribution():
     else:
         return "linux"
 
-def install_anaconda_python(args, remotes):
+def install_anaconda_python(args):
     """Provide isolated installation of Anaconda python for running bcbio-nextgen.
     http://docs.continuum.io/anaconda/index.html
     """
@@ -113,9 +154,9 @@ def install_anaconda_python(args, remotes):
         if os.path.exists(anaconda_dir):
             shutil.rmtree(anaconda_dir)
         dist = args.distribution if args.distribution else _guess_distribution()
-        url = remotes["anaconda"] % ("MacOSX" if dist.lower() == "macosx" else "Linux")
+        url = REMOTES["anaconda"] % ("MacOSX" if dist.lower() == "macosx" else "Linux")
         if not os.path.exists(os.path.basename(url)):
-            subprocess.check_call(["wget", url])
+            subprocess.check_call(["wget", "--progress=dot:mega", "--no-check-certificate", url])
         subprocess.check_call("bash %s -b -p %s" %
                               (os.path.basename(url), anaconda_dir), shell=True)
     return {"conda": conda,
@@ -145,11 +186,11 @@ def write_system_config(base_url, datadir, tooldir):
     if tooldir:
         java_basedir = os.path.join(tooldir, "share", "java")
     rewrite_ignore = ("log",)
-    with contextlib.closing(urllib2.urlopen(base_url)) as in_handle:
+    with contextlib.closing(urllib_request.urlopen(base_url)) as in_handle:
         with open(out_file, "w") as out_handle:
             in_resources = False
             in_prog = None
-            for line in in_handle:
+            for line in (l.decode("utf-8") for l in in_handle):
                 if line[0] != " ":
                     in_resources = line.startswith("resources")
                     in_prog = None
@@ -171,11 +212,7 @@ def write_system_config(base_url, datadir, tooldir):
 def setup_data_dir(args):
     if not os.path.exists(args.datadir):
         cmd = ["mkdir", "-p", args.datadir]
-        if args.sudo:
-            cmd.insert(0, "sudo")
         subprocess.check_call(cmd)
-    if args.sudo:
-        subprocess.check_call(["sudo", "chown", "-R", os.environ["USER"], args.datadir])
 
 @contextlib.contextmanager
 def bcbio_tmpdir():
@@ -188,21 +225,34 @@ def bcbio_tmpdir():
     os.chdir(orig_dir)
     shutil.rmtree(work_dir)
 
+def check_arguments(args):
+    """Ensure argruments are consistent and correct.
+    """
+    if args.toolplus and not args.tooldir:
+        raise argparse.ArgumentTypeError("Cannot specify --toolplus without --tooldir")
+
 def check_dependencies():
     """Ensure required tools for installation are present.
     """
     print("Checking required dependencies")
-    try:
-        subprocess.check_call(["git", "--version"])
-    except OSError:
-        raise OSError("bcbio-nextgen installer requires Git (http://git-scm.com/)")
+    for dep, msg in [(["git", "--version"], "Git (http://git-scm.com/)"),
+                     (["wget", "--version"], "wget"),
+                     (["bzip2", "-h"], "bzip2")]:
+        try:
+            p = subprocess.Popen(dep, stderr=subprocess.STDOUT, stdout=subprocess.PIPE)
+            out, code = p.communicate()
+        except OSError:
+            out = "Executable not found"
+            code = 127
+        if code == 127:
+            raise OSError("bcbio-nextgen installer requires %s\n%s" % (msg, out))
 
 def _check_toolplus(x):
     """Parse options for adding non-standard/commercial tools like GATK and MuTecT.
     """
     import argparse
     Tool = collections.namedtuple("Tool", ["name", "fname"])
-    std_choices = set(["data", "cadd", "dbnsfp"])
+    std_choices = set(["data", "dbnsfp", "ericscript"])
     if x in std_choices:
         return Tool(x, None)
     elif "=" in x and len(x.split("=")) == 2:
@@ -226,26 +276,36 @@ if __name__ == "__main__":
         description="Automatic installation for bcbio-nextgen pipelines")
     parser.add_argument("datadir", help="Directory to install genome data",
                         type=lambda x: (os.path.abspath(os.path.expanduser(x))))
+    parser.add_argument("--cores", default=1,
+                        help="Number of cores to use if local indexing is necessary.")
     parser.add_argument("--tooldir",
                         help="Directory to install 3rd party software tools. Leave unspecified for no tools",
                         type=lambda x: (os.path.abspath(os.path.expanduser(x))), default=None)
     parser.add_argument("--toolplus", help="Specify additional tool categories to install",
                         action="append", default=[], type=_check_toolplus)
+    parser.add_argument("--datatarget", help="Data to install. Allows customization or install of extra data.",
+                        action="append", default=[],
+                        choices=["variation", "rnaseq", "smallrna", "gemini", "vep", "dbnsfp",
+                                 "battenberg", "kraken", "ericscript", "gnomad"])
     parser.add_argument("--genomes", help="Genomes to download",
                         action="append", default=[],
-                        choices=["GRCh37", "hg19", "mm10", "mm9", "rn5", "canFam3", "dm3", "Zv9", "phix", "sacCer3",
-                                 "xenTro3", "TAIR10", "WBcel235", "pseudomonas_aeruginosa_ucbpp_pa14"])
+                        choices=["GRCh37", "hg19", "hg38", "hg38-noalt", "mm10", "mm9", "rn6", "rn5",
+                                 "canFam3", "dm3", "galGal4", "phix", "pseudomonas_aeruginosa_ucbpp_pa14",
+                                 "sacCer3", "TAIR10", "WBcel235", "xenTro3", "GRCz10", "GRCz11",
+                                 "Sscrofa11.1", "BDGP6"])
     parser.add_argument("--aligners", help="Aligner indexes to download",
                         action="append", default=[],
-                        choices=["bowtie", "bowtie2", "bwa", "novoalign", "snap", "star", "ucsc"])
+                        choices=["bbmap", "bowtie", "bowtie2", "bwa", "minimap2", "novoalign", "rtg", "snap",
+                                 "star", "ucsc", "hisat2"])
     parser.add_argument("--nodata", help="Do not install data dependencies",
                         dest="install_data", action="store_false", default=True)
-    parser.add_argument("--sudo", help="Use sudo for the installation, enabling install of system packages",
-                        dest="sudo", action="store_true", default=False)
     parser.add_argument("--isolate", help="Created an isolated installation without PATH updates",
                         dest="isolate", action="store_true", default=False)
+    parser.add_argument("--minimize-disk", help="Try to minimize disk usage (no MKL extensions)",
+                        dest="minimize_disk", action="store_true", default=False)
     parser.add_argument("-u", "--upgrade", help="Code version to install",
                         choices=["stable", "development"], default="stable")
+    parser.add_argument("--revision", help="Specify a git commit hash or tag to install", default="master")
     parser.add_argument("--distribution", help="Operating system distribution",
                         default="",
                         choices=["ubuntu", "debian", "centos", "scientificlinux", "macosx"])

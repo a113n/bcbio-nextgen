@@ -6,7 +6,7 @@ import os
 from bcbio import utils
 from bcbio.log import logger
 from bcbio.provenance import system
-from bcbio.distributed import clusterk, ipython, multi, resources
+from bcbio.distributed import multi, resources
 
 @contextlib.contextmanager
 def start(parallel, items, config, dirs=None, name=None, multiplier=1,
@@ -35,7 +35,7 @@ def start(parallel, items, config, dirs=None, name=None, multiplier=1,
         checkpoint_file = os.path.join(checkpoint_dir, "%s.done" % name)
     else:
         checkpoint_file = None
-    sysinfo = system.get_info(dirs, parallel)
+    sysinfo = system.get_info(dirs, parallel, config.get("resources", {}))
     items = [x for x in items if x is not None] if items else []
     max_multicore = int(max_multicore or sysinfo.get("cores", 1))
     parallel = resources.calculate(parallel, items, sysinfo, config,
@@ -43,22 +43,22 @@ def start(parallel, items, config, dirs=None, name=None, multiplier=1,
                                    max_multicore=max_multicore)
     try:
         view = None
-        if checkpoint_file and os.path.exists(checkpoint_file):
-            logger.info("run local -- checkpoint passed: %s" % name)
-            parallel["cores_per_job"] = 1
-            parallel["num_jobs"] = 1
-            parallel["checkpointed"] = True
-            yield multi.runner(parallel, config)
-        elif parallel["type"] == "ipython":
-            with ipython.create(parallel, dirs, config) as view:
-                yield ipython.runner(view, parallel, dirs, config)
-        elif parallel["type"] == "clusterk":
-            with clusterk.create(parallel) as queue:
-                yield clusterk.runner(queue, parallel)
+        if parallel["type"] == "ipython":
+            if checkpoint_file and os.path.exists(checkpoint_file):
+                logger.info("Running locally instead of distributed -- checkpoint passed: %s" % name)
+                parallel["cores_per_job"] = 1
+                parallel["num_jobs"] = 1
+                parallel["checkpointed"] = True
+                yield multi.runner(parallel, config)
+            else:
+                from bcbio.distributed import ipython
+                with ipython.create(parallel, dirs, config) as view:
+                    yield ipython.runner(view, parallel, dirs, config)
         else:
             yield multi.runner(parallel, config)
     except:
         if view is not None:
+            from bcbio.distributed import ipython
             ipython.stop(view)
         raise
     else:

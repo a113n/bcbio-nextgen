@@ -6,14 +6,26 @@ no-read regions.
 import collections
 import os
 
+import six
 import toolz as tz
 
+from bcbio import utils
 from bcbio.distributed.split import parallel_split_combine
+from bcbio.pipeline import datadict as dd
 
 def get_max_counts(samples):
-    """Retrieve the maximum region size from a set of callable regions
+    """Retrieve number of regions that can be processed in parallel from current samples.
     """
-    return max([tz.get_in(["config", "algorithm", "callable_count"], data[0], 1) for data in samples])
+    counts = []
+    for data in (x[0] for x in samples):
+        count = tz.get_in(["config", "algorithm", "callable_count"], data, 1)
+        vcs = tz.get_in(["config", "algorithm", "variantcaller"], data, [])
+        if isinstance(vcs, six.string_types):
+            vcs = [vcs]
+        if vcs:
+            count *= len(vcs)
+        counts.append(count)
+    return max(counts)
 
 # ## BAM preparation
 
@@ -31,10 +43,11 @@ def _split_by_regions(dirname, out_ext, in_key):
     def _do_work(data):
         # XXX Need to move retrieval of regions into preparation to avoid
         # need for files when running in non-shared filesystems
-        with open(data["config"]["algorithm"]["callable_regions"]) as in_handle:
-            regions = [(xs[0], int(xs[1]), int(xs[2])) for xs in
-                       (l.rstrip().split("\t") for l in in_handle) if (len(xs) >= 3 and
-                                                                       not xs[0].startswith(("track", "browser",)))]
+        regions = _get_parallel_regions(data)
+        def _sort_by_size(region):
+            _, start, end = region
+            return end - start
+        regions.sort(key=_sort_by_size, reverse=True)
         bam_file = data[in_key]
         if bam_file is None:
             return None, []
@@ -50,6 +63,41 @@ def _split_by_regions(dirname, out_ext, in_key):
                                 "%s%s" % (base_out, out_ext))
         return out_file, part_info
     return _do_work
+
+def _get_parallel_regions(data):
+    """Retrieve regions to run in parallel, putting longest intervals first.
+    """
+    callable_regions = tz.get_in(["config", "algorithm", "callable_regions"], data)
+    if not callable_regions:
+        raise ValueError("Did not find any callable regions for sample: %s\n"
+                            "Check 'align/%s/*-callableblocks.bed' and 'regions' to examine callable regions"
+                            % (dd.get_sample_name(data), dd.get_sample_name(data)))
+    with open(callable_regions) as in_handle:
+        regions = [(xs[0], int(xs[1]), int(xs[2])) for xs in
+                    (l.rstrip().split("\t") for l in in_handle) if (len(xs) >= 3 and
+                                                                    not xs[0].startswith(("track", "browser",)))]
+    return regions
+
+def get_parallel_regions(batch):
+    """CWL target to retrieve a list of callable regions for parallelization.
+    """
+    samples = [utils.to_single_data(d) for d in batch]
+    regions = _get_parallel_regions(samples[0])
+    return [{"region": "%s:%s-%s" % (c, s, e)} for c, s, e in regions]
+
+def get_parallel_regions_block(batch):
+    """CWL target to retrieve block group of callable regions for parallelization.
+
+    Uses blocking to handle multicore runs.
+    """
+    samples = [utils.to_single_data(d) for d in batch]
+    regions = _get_parallel_regions(samples[0])
+    out = []
+    # Currently don't have core information here so aim for about 10 items per partition
+    n = 10
+    for region_block in tz.partition_all(n, regions):
+        out.append({"region_block": ["%s:%s-%s" % (c, s, e) for c, s, e in region_block]})
+    return out
 
 def _add_combine_info(output, combine_map, file_key):
     """Do not actually combine, but add details for later combining work.
@@ -87,6 +135,8 @@ def _add_combine_info(output, combine_map, file_key):
         data = samples[0]
         data["region_bams"] = region_bams
         data["region"] = regions
+        data = dd.set_mark_duplicates(data, data["config"]["algorithm"]["orig_markduplicates"])
+        del data["config"]["algorithm"]["orig_markduplicates"]
         out.append([data])
     return out
 
@@ -101,12 +151,14 @@ def parallel_prep_region(samples, run_parallel):
     for data in [x[0] for x in samples]:
         if data.get("work_bam"):
             data["align_bam"] = data["work_bam"]
-        a = data["config"]["algorithm"]
-        if (not a.get("recalibrate") and not a.get("realign") and not a.get("variantcaller", "gatk")):
+        if (not dd.get_realign(data) and not dd.get_variantcaller(data)):
             extras.append([data])
         elif not data.get(file_key):
             extras.append([data])
         else:
+            # Do not want to re-run duplicate marking after realignment
+            data["config"]["algorithm"]["orig_markduplicates"] = dd.get_mark_duplicates(data)
+            data = dd.set_mark_duplicates(data, False)
             torun.append([data])
     return extras + parallel_split_combine(torun, split_fn, run_parallel,
                                            "piped_bamprep", _add_combine_info, file_key, ["config"])
@@ -114,13 +166,7 @@ def parallel_prep_region(samples, run_parallel):
 def delayed_bamprep_merge(samples, run_parallel):
     """Perform a delayed merge on regional prepared BAM files.
     """
-    needs_merge = False
-    for data in samples:
-        if (data[0]["config"]["algorithm"].get("merge_bamprep", True) and
-              "combine" in data[0]):
-            needs_merge = True
-            break
-    if needs_merge:
+    if any("combine" in data[0] for data in samples):
         return run_parallel("delayed_bam_merge", samples)
     else:
         return samples
@@ -131,13 +177,13 @@ def clean_sample_data(samples):
     """Clean unnecessary information from sample data, reducing size for message passing.
     """
     out = []
-    for data in (x[0] for x in samples):
+    for data in (utils.to_single_data(x) for x in samples):
         if "dirs" in data:
             data["dirs"] = {"work": data["dirs"]["work"], "galaxy": data["dirs"]["galaxy"],
                             "fastq": data["dirs"].get("fastq")}
         data["config"] = {"algorithm": data["config"]["algorithm"],
                           "resources": data["config"]["resources"]}
-        for remove_attr in ["config_file", "regions", "algorithm"]:
+        for remove_attr in ["config_file", "algorithm"]:
             data.pop(remove_attr, None)
         out.append([data])
     return out

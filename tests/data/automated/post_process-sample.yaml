@@ -1,25 +1,15 @@
 galaxy_config: universe_wsgi.ini
-algorithm:
-  platform: illumina
 
-# configuration algorithm changes for custom post-processing steps
-custom_algorithms:
-  variant:
-    aligner: bwa
-    recalibrate: gatk
-    snpcall: true
-    coverage_interval: "exome" # other options: genome
-  'RNA-seq':
-    aligner: tophat2
-    transcript_assemble: true
-  'Minimal':
-    aligner: ""
 # Define resources to be used for individual programs on multicore machines.
 # These can be defined specifically for memory and processor availability.
 # Distributed systems
 # - Specify usage for memory intensive programs
 # - Define cores that can be used for multicore programs.
 resources:
+  default:
+    memory: 2G
+    cores: 4
+    jvm_opts: ["-Xms750m", "-Xmx2000m"]
   bcbio_variation:
     dir: /usr/local/share/java/bcbio_variation
   bcbio_coverage:
@@ -43,9 +33,14 @@ resources:
   samtools:
     cores: 4
     memory: 1G
+  sailfish:
+    cores: 4
+    memory: 1G
   novoalign:
     cores: 4
     memory: 4G
+  miraligner:
+    jvm_opts: ["-Xms750m", "-Xmx8000m"]
   gemini:
     cores: 4
   gatk:
@@ -66,8 +61,6 @@ resources:
     dir: /usr/local/share/java/mutect
   cram:
     dir: /usr/local/share/java/cram
-  rnaseqc:
-    dir: /usr/local/share/java/RNA-SeQC
   stampy:
     dir: ~/install/stampy-1.0.18
   cortex:

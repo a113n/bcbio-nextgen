@@ -7,12 +7,12 @@ prediction.
 
 http://cortexassembler.sourceforge.net/index_cortex_var.html
 """
+from __future__ import print_function
 import os
 import glob
 import subprocess
 import itertools
 import shutil
-from contextlib import closing
 
 import pysam
 from Bio import Seq
@@ -54,7 +54,7 @@ def run_cortex(align_bams, items, ref_file, assoc_files, region=None,
                                                        ref_file, work_dir, out_file, config)
                                  for x in in_handle]
 
-            combine_file = apply("{0}-raw{1}".format, os.path.splitext(out_file))
+            combine_file = "{0}-raw{1}".format(*os.path.splitext(out_file))
             _combine_variants(regional_vcfs, combine_file, ref_file, config)
             _select_final_variants(combine_file, out_file, config)
         else:
@@ -129,7 +129,7 @@ def _run_cortex_on_region(region, align_bam, ref_file, work_dir, out_file_base, 
     vcftools_dir = config_utils.get_program("vcftools", config, "dir")
     if cortex_dir is None or stampy_dir is None:
         raise ValueError("cortex_var requires path to pre-built cortex and stampy")
-    region_str = apply("{0}-{1}-{2}".format, region)
+    region_str = "{0}-{1}-{2}".format(*region)
     base_dir = safe_makedir(os.path.join(work_dir, region_str))
     try:
         out_vcf_base = os.path.join(base_dir, "{0}-{1}".format(
@@ -190,7 +190,7 @@ def _remap_cortex_out(cortex_out, region, out_file):
 def _run_cortex(fastq, indexes, params, out_base, dirs, config):
     """Run cortex_var run_calls.pl, producing a VCF variant file.
     """
-    print out_base
+    print(out_base)
     fastaq_index = "{0}.fastaq_index".format(out_base)
     se_fastq_index = "{0}.se_fastq".format(out_base)
     pe_fastq_index = "{0}.pe_fastq".format(out_base)
@@ -236,7 +236,7 @@ def _run_cortex(fastq, indexes, params, out_base, dirs, config):
                                    "{0}*FINALcombined_BC*decomp.vcf".format(os.path.basename(out_base))))
     # No calls, need to setup an empty file
     if len(final) != 1:
-        print "Did not find output VCF file for {0}".format(out_base)
+        print("Did not find output VCF file for {0}".format(out_base))
         return None
     else:
         return final[0]
@@ -284,7 +284,7 @@ def _get_local_ref(region, ref_file, out_vcf_base):
     """
     out_file = "{0}.fa".format(out_vcf_base)
     if not file_exists(out_file):
-        with closing(pysam.Fastafile(ref_file)) as in_pysam:
+        with pysam.Fastafile(ref_file) as in_pysam:
             contig, start, end = region
             seq = in_pysam.fetch(contig, int(start), int(end))
             with open(out_file, "w") as out_handle:
@@ -302,7 +302,7 @@ def _get_fastq_in_region(region, align_bam, out_base):
     """
     out_file = "{0}.fastq".format(out_base)
     if not file_exists(out_file):
-        with closing(pysam.Samfile(align_bam, "rb")) as in_pysam:
+        with pysam.Samfile(align_bam, "rb") as in_pysam:
             with file_transaction(out_file) as tx_out_file:
                 with open(tx_out_file, "w") as out_handle:
                     contig, start, end = region
@@ -327,6 +327,6 @@ def _count_fastq_reads(in_fastq, min_reads):
     return len(items)
 
 def get_sample_name(align_bam):
-    with closing(pysam.Samfile(align_bam, "rb")) as in_pysam:
+    with pysam.Samfile(align_bam, "rb") as in_pysam:
         if "RG" in in_pysam.header:
             return in_pysam.header["RG"][0]["SM"]

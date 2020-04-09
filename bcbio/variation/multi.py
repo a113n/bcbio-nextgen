@@ -4,50 +4,62 @@ Handles grouping of related families or batches to go through variant
 calling simultaneously.
 """
 import collections
-import os
 
 import toolz as tz
 
 from bcbio import utils
+from bcbio.pipeline import datadict as dd
 from bcbio.variation import vcfutils
 
 # ## Group batches to process together
 
-def group_by_batch(items):
+def group_by_batch(items, require_bam=True):
     """Group a set of sample items by batch (or singleton) name.
 
     Items in multiple batches cause two batches to be merged together.
     """
     out = collections.defaultdict(list)
-    batch_groups = _get_representative_batch(_merge_batches(_find_all_groups(items)))
+    batch_groups = _get_representative_batch(_merge_batches(_find_all_groups(items, require_bam)))
     for data in items:
-        batch = batch_groups[_get_batches(data)[0]]
-        out[batch].append(data)
+        batches = _get_batches(data, require_bam)
+        # take first batch as representative
+        batch = batch_groups[batches[0]]
+        out[batch].append(utils.deepish_copy(data))
     return dict(out)
 
 def bam_needs_processing(data):
     """Check if a work input needs processing for parallelization.
     """
-    return (data.get("work_bam") and
-            any(tz.get_in(["config", "algorithm", x], data) for x in
-                ["variantcaller", "mark_duplicates", "recalibrate", "realign", "svcaller",
-                 "jointcaller"]))
+    return ((data.get("work_bam") or data.get("align_bam")) and
+            (any(tz.get_in(["config", "algorithm", x], data) for x in
+                 ["variantcaller", "mark_duplicates", "recalibrate", "realign", "svcaller",
+                  "jointcaller", "variant_regions"])
+             or any(k in data for k in ["cwl_keys", "output_cwl_keys"])))
 
-def _get_batches(data):
-    if bam_needs_processing(data):
-        batches = tz.get_in(("metadata", "batch"), data, data["description"])
+def get_batch_for_key(data):
+    """Retrieve batch information useful as a unique key for the sample.
+    """
+    batches = _get_batches(data, require_bam=False)
+    if len(batches) == 1:
+        return batches[0]
     else:
-        batches = data["description"]
+        return tuple(batches)
+
+def _get_batches(data, require_bam=True):
+    if bam_needs_processing(data) or not require_bam:
+        batches = dd.get_batch(data) or dd.get_sample_name(data)
+    else:
+        batches = dd.get_sample_name(data)
     if not isinstance(batches, (list, tuple)):
         batches = [batches]
     return batches
 
-def _find_all_groups(items):
+def _find_all_groups(items, require_bam=True):
     """Find all groups
     """
     all_groups = []
     for data in items:
-        batches = _get_batches(data)
+        batches = _get_batches(data, require_bam)
         all_groups.append(batches)
     return all_groups
 
@@ -97,8 +109,7 @@ def _group_batches_shared(xs, caller_batch_fn, prep_data_fn):
     singles = []
     batch_groups = collections.defaultdict(list)
     for args in xs:
-        assert len(args) == 1
-        data = args[0]
+        data = utils.to_single_data(args)
         caller, batch = caller_batch_fn(data)
         region = _list_to_tuple(data["region"]) if "region" in data else ()
         if batch is not None:
@@ -109,8 +120,12 @@ def _group_batches_shared(xs, caller_batch_fn, prep_data_fn):
             data = prep_data_fn(data, [data])
             singles.append(data)
     batches = []
-    for batch, items in batch_groups.iteritems():
+    for batch, items in batch_groups.items():
         batch_data = utils.deepish_copy(_pick_lead_item(items))
+        # For nested primary batches, split permanently by batch
+        if tz.get_in(["metadata", "batch"], batch_data):
+            batch_name = batch[0]
+            batch_data["metadata"]["batch"] = batch_name
         batch_data = prep_data_fn(batch_data, items)
         batch_data["group_orig"] = _collapse_subitems(batch_data, items)
         batch_data["group"] = batch
@@ -128,7 +143,7 @@ def group_batches(xs):
     Only batches files if joint calling not specified.
     """
     def _caller_batches(data):
-        caller = tz.get_in(("config", "algorithm", "variantcaller"), data, "gatk")
+        caller = tz.get_in(("config", "algorithm", "variantcaller"), data)
         jointcaller = tz.get_in(("config", "algorithm", "jointcaller"), data)
         batch = tz.get_in(("metadata", "batch"), data) if not jointcaller else None
         return caller, batch
@@ -148,7 +163,7 @@ def group_batches_joint(samples):
         for r in ["callable_regions", "variant_regions"]:
             data[r] = list(set(filter(lambda x: x is not None,
                                       [tz.get_in(("config", "algorithm", r), d) for d in items])))
-        data["work_bams"] = [x.get("align_bam", x.get("work_bam")) for x in items]
+        data["work_bams"] = [dd.get_align_bam(x) or dd.get_work_bam(x) for x in items]
         data["vrn_files"] = [x["vrn_file"] for x in items]
         return data
     return _group_batches_shared(samples, _caller_batches, _prep_data)
@@ -185,7 +200,7 @@ def _pick_lead_item(items):
 
     For cancer samples, attach to tumor.
     """
-    if vcfutils.is_paired_analysis([x["align_bam"] for x in items], items):
+    if vcfutils.is_paired_analysis([dd.get_align_bam(x) for x in items], items):
         for data in items:
             if vcfutils.get_paired_phenotype(data) == "tumor":
                 return data
@@ -228,33 +243,27 @@ def split_variants_by_sample(data):
     if "group_orig" not in data:
         return [[data]]
     # cancer tumor/normal
-    elif vcfutils.get_paired_phenotype(data):
+    elif (vcfutils.get_paired_phenotype(data)
+            and "tumor" in [vcfutils.get_paired_phenotype(d) for d in get_orig_items(data)]):
         out = []
         for i, sub_data in enumerate(get_orig_items(data)):
             if vcfutils.get_paired_phenotype(sub_data) == "tumor":
+                cur_batch = tz.get_in(["metadata", "batch"], data)
+                if cur_batch:
+                    sub_data["metadata"]["batch"] = cur_batch
                 sub_data["vrn_file"] = data["vrn_file"]
             else:
                 sub_data.pop("vrn_file", None)
             out.append([sub_data])
         return out
-    # joint calling, do not split back up due to potentially large sample sizes
-    elif tz.get_in(("config", "algorithm", "jointcaller"), data):
-        out = []
-        for sub_data in get_orig_items(data):
-            sub_data["vrn_file_batch"] = data["vrn_file"]
-            sub_data["vrn_file"] = data["vrn_file"]
-            out.append([sub_data])
-        return out
-    # population or single sample
+    # joint calling or population runs, do not split back up and keep in batches
     else:
         out = []
         for sub_data in get_orig_items(data):
-            sub_vrn_file = data["vrn_file"].replace(str(data["group"][0]) + "-", str(sub_data["name"][-1]) + "-")
-            if len(vcfutils.get_samples(data["vrn_file"])) > 1:
-                vcfutils.select_sample(data["vrn_file"], str(sub_data["name"][-1]), sub_vrn_file, data["config"])
-            elif not os.path.exists(sub_vrn_file):
-                utils.symlink_plus(data["vrn_file"], sub_vrn_file)
+            cur_batch = tz.get_in(["metadata", "batch"], data)
+            if cur_batch:
+                sub_data["metadata"]["batch"] = cur_batch
             sub_data["vrn_file_batch"] = data["vrn_file"]
-            sub_data["vrn_file"] = sub_vrn_file
+            sub_data["vrn_file"] = data["vrn_file"]
             out.append([sub_data])
         return out

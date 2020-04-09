@@ -61,12 +61,18 @@ def _get_machine_info(parallel, sys_config, dirs, config):
 def _slurm_info(queue):
     """Returns machine information for a slurm job scheduler.
     """
-    cl = "sinfo -h -p {} --format '%c %m'".format(queue)
-    num_cpus, mem = subprocess.check_output(shlex.split(cl)).split()
+    cl = "sinfo -h -p {} --format '%c %m %D'".format(queue)
+    num_cpus, mem, num_nodes = subprocess.check_output(shlex.split(cl)).decode().split()
     # if the queue contains multiple memory configurations, the minimum value is printed with a trailing '+'
-    mem = mem.replace('+', '')
+    mem = float(mem.replace('+', ''))
     num_cpus = int(num_cpus.replace('+', ''))
-    return [{"cores": int(num_cpus), "memory": float(mem) / 1024.0, "name": "slurm_machine"}]
+    # handle small clusters where we need to allocate memory for bcbio and the controller
+    # This will typically be on cloud AWS machines
+    bcbio_mem = 2000
+    controller_mem = 4000
+    if int(num_nodes) < 3 and mem > (bcbio_mem + controller_mem) * 2:
+        mem = mem - bcbio_mem - controller_mem
+    return [{"cores": int(num_cpus), "memory": mem / 1024.0, "name": "slurm_machine"}]
 
 def _torque_info(queue):
     """Return machine information for a torque job scheduler using pbsnodes.
@@ -77,7 +83,7 @@ def _torque_info(queue):
     hosts are available, it uses the first host found from pbsnodes.
     """
     nodes = _torque_queue_nodes(queue)
-    pbs_out = subprocess.check_output(["pbsnodes"])
+    pbs_out = subprocess.check_output(["pbsnodes"]).decode()
     info = {}
     for i, line in enumerate(pbs_out.split("\n")):
         if i == 0 and len(nodes) == 0:
@@ -88,7 +94,7 @@ def _torque_info(queue):
             if line.strip().startswith("np = "):
                 info["cores"] = int(line.replace("np = ", "").strip())
             elif line.strip().startswith("status = "):
-                mem = [x for x in pbs_out.split(",") if x.startswith("totmem=")][0]
+                mem = [x for x in pbs_out.split(",") if x.startswith("physmem=")][0]
                 info["memory"] = float(mem.split("=")[1].rstrip("kb")) / 1048576.0
                 return [info]
 
@@ -98,7 +104,7 @@ def _torque_queue_nodes(queue):
     Parses out nodes from `acl_hosts` in qstat -Qf and extracts the
     initial names of nodes used in pbsnodes.
     """
-    qstat_out = subprocess.check_output(["qstat", "-Qf", queue])
+    qstat_out = subprocess.check_output(["qstat", "-Qf", queue]).decode()
     hosts = []
     in_hosts = False
     for line in qstat_out.split("\n"):
@@ -122,12 +128,12 @@ def median_left(x):
 def _sge_info(queue):
     """Returns machine information for an sge job scheduler.
     """
-    qhost_out = subprocess.check_output(["qhost", "-q", "-xml"])
+    qhost_out = subprocess.check_output(["qhost", "-q", "-xml"]).decode()
     qstat_queue = ["-q", queue] if queue and "," not in queue else []
-    qstat_out = subprocess.check_output(["qstat", "-f", "-xml"] + qstat_queue)
+    qstat_out = subprocess.check_output(["qstat", "-f", "-xml"] + qstat_queue).decode()
     slot_info = _sge_get_slots(qstat_out)
     mem_info = _sge_get_mem(qhost_out, queue)
-    machine_keys = slot_info.keys()
+    machine_keys = list(slot_info.keys())
     #num_cpus_vec = [slot_info[x]["slots_total"] for x in machine_keys]
     #mem_vec = [mem_info[x]["mem_total"] for x in machine_keys]
     mem_per_slot = [mem_info[x]["mem_total"] / float(slot_info[x]["slots_total"]) for x in machine_keys]
@@ -185,14 +191,20 @@ def _combine_machine_info(xs):
     else:
         raise NotImplementedError("Add logic to pick specification from non-homogeneous clusters.")
 
-def get_info(dirs, parallel):
+def get_info(dirs, parallel, resources=None):
     """Retrieve cluster or local filesystem resources from pre-retrieved information.
     """
-    if parallel["type"] in ["ipython"]:
+    # Allow custom specification of cores/memory in resources
+    if resources and isinstance(resources, dict) and "machine" in resources:
+        minfo = resources["machine"]
+        assert "memory" in minfo, "Require memory specification (Gb) in machine resources: %s" % minfo
+        assert "cores" in minfo, "Require core specification in machine resources: %s" % minfo
+        return minfo
+    if parallel["type"] in ["ipython"] and not parallel["queue"] == "localrun":
         cache_file = _get_cache_file(dirs, parallel)
         if utils.file_exists(cache_file):
             with open(cache_file) as in_handle:
-                minfo = yaml.load(in_handle)
+                minfo = yaml.safe_load(in_handle)
             return _combine_machine_info(minfo)
         else:
             return {}

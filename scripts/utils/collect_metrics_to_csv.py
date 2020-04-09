@@ -9,7 +9,6 @@ import os
 import csv
 import glob
 import collections
-import contextlib
 
 import yaml
 import pysam
@@ -138,7 +137,7 @@ def _generate_metrics(bam_fname, config_file, ref_file,
     """Run Picard commands to generate metrics files when missing.
     """
     with open(config_file) as in_handle:
-        config = yaml.load(in_handle)
+        config = yaml.safe_load(in_handle)
     broad_runner = broad.runner_from_config(config)
     bam_fname = os.path.abspath(bam_fname)
     path = os.path.dirname(bam_fname)
@@ -156,7 +155,7 @@ def _generate_metrics(bam_fname, config_file, ref_file,
     return out_dir
 
 def _bam_is_paired(bam_fname):
-    with contextlib.closing(pysam.Samfile(bam_fname, "rb")) as work_bam:
+    with pysam.Samfile(bam_fname, "rb") as work_bam:
         for read in work_bam:
             if not read.is_unmapped:
                 return read.is_paired

@@ -10,11 +10,6 @@ details:
     #   batch: your-arbitrary-batch-name
     algorithm:
       aligner: bwa
-      mark_duplicates: true
-      recalibrate: false
-      realign: false
       variantcaller: freebayes
-      platform: illumina
-      quality_format: Standard
       # for targetted projects, set the region
       # variant_regions: /path/to/your.bed

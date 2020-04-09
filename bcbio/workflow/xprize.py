@@ -34,7 +34,7 @@ def get_fc_date(out_config_file):
     """
     if os.path.exists(out_config_file):
         with open(out_config_file) as in_handle:
-            old_config = yaml.load(in_handle)
+            old_config = yaml.safe_load(in_handle)
             fc_date = old_config["fc_date"]
     else:
         fc_date = datetime.datetime.now().strftime("%y%m%d")
@@ -77,6 +77,3 @@ def setup(args):
     workdir = utils.safe_makedir(os.path.join(args.base_dir, args.sample, "work"))
     return workdir, {"config_file": args.bcbio_config_file,
                      "run_info_yaml": out_config_file}
-
-if __name__ == "__main__":
-    main(*sys.argv[1:])

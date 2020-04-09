@@ -10,14 +10,21 @@ import subprocess
 from bcbio import bam, utils
 from bcbio.ngsalign import alignprep, postalign
 from bcbio.pipeline import config_utils
+from bcbio.pipeline import datadict as dd
 from bcbio.provenance import do
 from bcbio.distributed.transaction import tx_tmpdir
 from bcbio.utils import (memoize_outfile, file_exists)
 
+import six
+
+
 # ## BAM realignment
 
 def get_rg_info(names):
-    return r"@RG\tID:{rg}\tPL:{pl}\tPU:{pu}\tSM:{sample}".format(**names)
+    out = r"@RG\tID:{rg}\tPL:{pl}\tPU:{pu}\tSM:{sample}".format(**names)
+    if names.get("lb"):
+        out += r"\tLB:{lb}".format(**names)
+    return out
 
 def align_bam(in_bam, ref_file, names, align_dir, data):
     """Perform realignment of input BAM file; uses unix pipes for avoid IO.
@@ -37,10 +44,11 @@ def align_bam(in_bam, ref_file, names, align_dir, data):
                 rg_info = get_rg_info(names)
                 tx_out_prefix = os.path.splitext(tx_out_file)[0]
                 prefix1 = "%s-in1" % tx_out_prefix
-                cmd = ("{samtools} sort -n -o -l 1 -@ {num_cores} -m {max_mem} {in_bam} {prefix1} "
+                cmd = ("unset JAVA_HOME && "
+                       "{samtools} sort -n -o -l 1 -@ {num_cores} -m {max_mem} {in_bam} {prefix1} "
                        "| {novoalign} -o SAM '{rg_info}' -d {ref_file} -f /dev/stdin "
                        "  -F BAMPE -c {num_cores} {extra_novo_args} | ")
-                cmd = cmd.format(**locals()) + tobam_cl
+                cmd = (cmd + tobam_cl).format(**locals())
                 do.run(cmd, "Novoalign: %s" % names["sample"], None,
                        [do.file_nonempty(tx_out_file), do.file_reasonable_size(tx_out_file, in_bam)])
     return out_file
@@ -51,13 +59,14 @@ def align_pipe(fastq_file, pair_file, ref_file, names, align_dir, data):
     """Perform piped alignment of fastq input files, generating sorted output BAM.
     """
     pair_file = pair_file if pair_file else ""
+    # back compatible -- older files were named with lane information, use sample name now
     out_file = os.path.join(align_dir, "{0}-sort.bam".format(names["lane"]))
-    if data.get("align_split"):
+    if not utils.file_exists(out_file):
+        out_file = os.path.join(align_dir, "{0}-sort.bam".format(dd.get_sample_name(data)))
+    if data.get("align_split") or fastq_file.endswith(".sdf"):
         final_file = out_file
         out_file, data = alignprep.setup_combine(final_file, data)
-        fastq_file = alignprep.split_namedpipe_cl(fastq_file, data)
-        if pair_file:
-            pair_file = alignprep.split_namedpipe_cl(pair_file, data)
+        fastq_file, pair_file = alignprep.split_namedpipe_cls(fastq_file, pair_file, data)
     else:
         final_file = None
     samtools = config_utils.get_program("samtools", data["config"])
@@ -71,9 +80,10 @@ def align_pipe(fastq_file, pair_file, ref_file, names, align_dir, data):
         with tx_tmpdir(data) as work_dir:
             with postalign.tobam_cl(data, out_file, pair_file != "") as (tobam_cl, tx_out_file):
                 tx_out_prefix = os.path.splitext(tx_out_file)[0]
-                cmd = ("{novoalign} -o SAM '{rg_info}' -d {ref_file} -f {fastq_file} {pair_file} "
+                cmd = ("unset JAVA_HOME && "
+                       "{novoalign} -o SAM '{rg_info}' -d {ref_file} -f {fastq_file} {pair_file} "
                        "  -c {num_cores} {extra_novo_args} | ")
-                cmd = cmd.format(**locals()) + tobam_cl
+                cmd = (cmd + tobam_cl).format(**locals())
                 do.run(cmd, "Novoalign: %s" % names["sample"], None,
                        [do.file_nonempty(tx_out_file), do.file_reasonable_size(tx_out_file, fastq_file)])
     data["work_bam"] = out_file
@@ -90,7 +100,7 @@ def _novoalign_args_from_config(config, need_quality=True):
     multi_mappers = config["algorithm"].get("multiple_mappers")
     if multi_mappers is True:
         multi_flag = "Random"
-    elif isinstance(multi_mappers, basestring):
+    elif isinstance(multi_mappers, six.string_types):
         multi_flag = multi_mappers
     else:
         multi_flag = "None"

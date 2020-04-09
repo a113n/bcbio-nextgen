@@ -8,15 +8,14 @@ import os
 import copy
 import collections
 import subprocess
-from contextlib import closing
 
-import numpy
 import pysam
 
 from bcbio import utils, broad
 from bcbio.pipeline.alignment import align_to_sort_bam
 from bcbio.pipeline import lane
 from bcbio.distributed.transaction import file_transaction
+from bcbio.structural import shared
 
 ## Prepare alignments to identify discordant pair mappings
 
@@ -34,7 +33,7 @@ def select_unaligned_read_pairs(in_bam, extra, out_dir, config):
                                           ("WRITE_READS_FILES", "false"),
                                           ("SORT_ORDER", "queryname")])
     has_reads = False
-    with closing(pysam.Samfile(nomap_bam, "rb")) as in_pysam:
+    with pysam.Samfile(nomap_bam, "rb") as in_pysam:
         for read in in_pysam:
             if read.is_paired:
                 has_reads = True
@@ -50,43 +49,21 @@ def remove_nopairs(in_bam, out_dir, config):
     """Remove any reads without both pairs present in the file.
     """
     runner = broad.runner_from_config(config)
-    out_bam = os.path.join(out_dir, apply("{}-safepair{}".format,
-                                          os.path.splitext(os.path.basename(in_bam))))
+    out_bam = os.path.join(out_dir, "{}-safepair{}".format(*os.path.splitext(os.path.basename(in_bam))))
     if not utils.file_exists(out_bam):
         read_counts = collections.defaultdict(int)
-        with closing(pysam.Samfile(in_bam, "rb")) as in_pysam:
+        with pysam.Samfile(in_bam, "rb") as in_pysam:
             for read in in_pysam:
                 if read.is_paired:
                     read_counts[read.qname] += 1
-        with closing(pysam.Samfile(in_bam, "rb")) as in_pysam:
+        with pysam.Samfile(in_bam, "rb") as in_pysam:
             with file_transaction(out_bam) as tx_out_bam:
-                with closing(pysam.Samfile(tx_out_bam, "wb", template=in_pysam)) as out_pysam:
+                with pysam.Samfile(tx_out_bam, "wb", template=in_pysam) as out_pysam:
                     for read in in_pysam:
                         if read_counts[read.qname] == 2:
                             out_pysam.write(read)
     return runner.run_fn("picard_sort", out_bam, "queryname")
 
-def insert_size_stats(dists):
-    """Calcualtes mean/median and MAD from distances, avoiding outliers.
-
-    MAD is the Median Absolute Deviation: http://en.wikipedia.org/wiki/Median_absolute_deviation
-    """
-    med = numpy.median(dists)
-    filter_dists = filter(lambda x: x < med + 10 * med, dists)
-    median = numpy.median(filter_dists)
-    return {"mean": numpy.mean(filter_dists), "std": numpy.std(filter_dists),
-            "median": median,
-            "mad": numpy.median([abs(x - median) for x in filter_dists])}
-
-def calc_paired_insert_stats(in_bam):
-    """Retrieve statistics for paired end read insert distances.
-    """
-    dists = []
-    with closing(pysam.Samfile(in_bam, "rb")) as in_pysam:
-        for read in in_pysam:
-            if read.is_proper_pair and read.is_read1:
-                dists.append(abs(read.isize))
-    return insert_size_stats(dists)
 
 def tiered_alignment(in_bam, tier_num, multi_mappers, extra_args,
                      genome_build, pair_stats,
@@ -172,7 +149,7 @@ def detect_sv(align_bam, genome_build, dirs, config):
     """Detect structural variation from discordant aligned pairs.
     """
     work_dir = utils.safe_makedir(os.path.join(dirs["work"], "structural"))
-    pair_stats = calc_paired_insert_stats(align_bam)
+    pair_stats = shared.calc_paired_insert_stats(align_bam)
     fix_bam = remove_nopairs(align_bam, work_dir, config)
     tier2_align = tiered_alignment(fix_bam, "2", True, [],
                                    genome_build, pair_stats,

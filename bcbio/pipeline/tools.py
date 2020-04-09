@@ -3,6 +3,8 @@
 Abstracts out
 """
 import subprocess
+import toolz as tz
+from bcbio.pipeline import datadict as dd
 from bcbio.pipeline import config_utils
 
 def get_tabix_cmd(config):
@@ -12,7 +14,7 @@ def get_tabix_cmd(config):
         bcftools = config_utils.get_program("bcftools", config)
         # bcftools has terrible error codes and stderr output, swallow those.
         bcftools_tabix = subprocess.check_output("{bcftools} 2>&1; echo $?".format(**locals()),
-                                                 shell=True).find("tabix") >= 0
+                                                 shell=True).decode().find("tabix") >= 0
     except config_utils.CmdNotFound:
         bcftools_tabix = False
     if bcftools_tabix:
@@ -22,20 +24,14 @@ def get_tabix_cmd(config):
         return tabix
 
 def get_bgzip_cmd(config, is_retry=False):
-    """Retrieve command to use for bgzip, trying to use parallel pbgzip if available.
+    """Retrieve command to use for bgzip, trying to use bgzip parallel threads.
 
-    XXX Currently uses non-parallel bgzip until we can debug segfault issues
-    with pbgzip.
-
-    Avoids over committing cores to gzipping since run in pipe with other tools.
-    Allows for retries which force single core bgzip mode.
+    By default, parallel bgzip is enabled in bcbio. If it causes problems
+    please report them. You can turn parallel bgzip off with `tools_off: [pbgzip]`
     """
-    num_cores = max(1, (config.get("algorithm", {}).get("num_cores", 1) // 2) - 1)
-    #if not is_retry and num_cores > 1:
-    if False:
-        try:
-            pbgzip = config_utils.get_program("pbgzip", config)
-            return "%s -n %s " % (pbgzip, num_cores)
-        except config_utils.CmdNotFound:
-            pass
-    return config_utils.get_program("bgzip", config)
+    num_cores = tz.get_in(["algorithm", "num_cores"], config, 1)
+    cmd = config_utils.get_program("bgzip", config)
+    if (not is_retry and num_cores > 1 and
+          "pbgzip" not in dd.get_tools_off({"config": config})):
+        cmd += " --threads %s" % num_cores
+    return cmd

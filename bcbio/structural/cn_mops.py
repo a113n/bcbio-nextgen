@@ -2,7 +2,6 @@
 
 http://www.bioconductor.org/packages/release/bioc/html/cn.mops.html
 """
-from contextlib import closing
 import os
 import re
 import shutil
@@ -11,11 +10,11 @@ import subprocess
 import pysam
 import toolz as tz
 
-from bcbio import bam, install, utils
+from bcbio import bam, utils
 from bcbio.distributed.multi import run_multicore, zeromq_aware_logging
 from bcbio.distributed.transaction import file_transaction
 from bcbio.log import logger
-from bcbio.pipeline import config_utils, shared
+from bcbio.pipeline import shared
 from bcbio.provenance import do
 from bcbio.structural import shared as sshared
 from bcbio.variation import bedutils, vcfutils
@@ -33,7 +32,7 @@ def run(items, background=None):
                                                "cn_mops"))
     parallel = {"type": "local", "cores": data["config"]["algorithm"].get("num_cores", 1),
                 "progs": ["delly"]}
-    with closing(pysam.Samfile(work_bams[0], "rb")) as pysam_work_bam:
+    with pysam.Samfile(work_bams[0], "rb") as pysam_work_bam:
         chroms = [None] if _get_regional_bed_file(items[0]) else pysam_work_bam.references
         out_files = run_multicore(_run_on_chrom, [(chrom, work_bams, names, work_dir, items)
                                                   for chrom in chroms],
@@ -73,7 +72,7 @@ def _prep_sample_cnvs(cnv_file, data):
     import pybedtools
     sample_name = tz.get_in(["rgnames", "sample"], data)
     def make_names(name):
-        return re.sub("[^\w.]", '.', name)
+        return re.sub(r"[^\w.]", '.', name)
     def matches_sample_name(feat):
         return (feat.name == sample_name or feat.name == "X%s" % sample_name or
                 feat.name == make_names(sample_name))
@@ -92,8 +91,7 @@ def _prep_sample_cnvs(cnv_file, data):
 def _run_on_chrom(chrom, work_bams, names, work_dir, items):
     """Run cn.mops on work BAMs for a specific chromosome.
     """
-    local_sitelib = os.path.join(install.get_defaults().get("tooldir", "/usr/local"),
-                                 "lib", "R", "site-library")
+    local_sitelib = utils.R_sitelib()
     batch = sshared.get_cur_batch(items)
     ext = "-%s-cnv" % batch if batch else "-cnv"
     out_file = os.path.join(work_dir, "%s%s-%s.bed" % (os.path.splitext(os.path.basename(work_bams[0]))[0],
@@ -105,10 +103,10 @@ def _run_on_chrom(chrom, work_bams, names, work_dir, items):
                 out_handle.write(_script.format(prep_str=_prep_load_script(work_bams, names, chrom, items),
                                                 out_file=tx_out_file,
                                                 local_sitelib=local_sitelib))
-            rscript = config_utils.get_program("Rscript", items[0]["config"])
+            rscript = utils.Rscript_cmd()
             try:
-                do.run([rscript, rcode], "cn.mops CNV detection", items[0], log_error=False)
-            except subprocess.CalledProcessError, msg:
+                do.run([rscript, "--vanilla", rcode], "cn.mops CNV detection", items[0], log_error=False)
+            except subprocess.CalledProcessError as msg:
                 # cn.mops errors out if no CNVs found. Just write an empty file.
                 if _allowed_cnmops_errorstates(str(msg)):
                     with open(tx_out_file, "w") as out_handle:
@@ -121,7 +119,8 @@ def _run_on_chrom(chrom, work_bams, names, work_dir, items):
 def _allowed_cnmops_errorstates(msg):
     return (msg.find("No CNV regions in result object. Rerun cn.mops with different parameters") >= 0
             or msg.find("Normalization might not be applicable for this small number of segments") >= 0
-            or msg.find("Error in if (is.finite(mv2m)) { : argument is of length zero") >= 0)
+            or msg.find("Error in if (is.finite(mv2m)) { : argument is of length zero") >= 0
+            or msg.find("Some normalization factors are zero") >= 0)
 
 def _prep_load_script(work_bams, names, chrom, items):
     if not chrom: chrom = ""

@@ -1,7 +1,17 @@
 #!/bin/bash
-sudo apt-get update
-sudo apt-get install -y build-essential zlib1g-dev wget curl python-setuptools git libz-dev
-mkdir tmp
-cd tmp
-wget https://raw.github.com/chapmanb/bcbio-nextgen/master/scripts/bcbio_nextgen_install.py
-## python bcbio_nextgen_install.py /usr/local/share/bcbio-nextgen --tooldir=/usr/local --sudo --genomes GRCh37 --aligners bwa
+
+set -e -x
+
+/usr/bin/apt-get -qq update
+/usr/bin/apt-get install -q -y build-essential docker.io python-setuptools zlib1g-dev
+/usr/bin/apt-get -y autoremove
+/usr/bin/apt-get clean
+
+/bin/systemctl start docker.service
+/usr/sbin/usermod -aG docker vagrant
+
+NEW_PATH='${HOME}/local/share/bcbio/anaconda/bin:${HOME}/local/bin:${PATH}'
+/bin/grep -qxF "PATH=${NEW_PATH}" ~vagrant/.profile || /bin/echo "PATH=${NEW_PATH}" >> ~vagrant/.profile
+/bin/grep -qxF 'export BCBIO_TEST_DIR=/tmp/bcbio' ~vagrant/.profile || /bin/echo 'export BCBIO_TEST_DIR=/tmp/bcbio' >> ~vagrant/.profile
+
+/usr/bin/wget --no-verbose -P /opt https://raw.githubusercontent.com/bcbio/bcbio-nextgen/master/scripts/bcbio_nextgen_install.py

@@ -1,7 +1,6 @@
-version: 5
+version: 10
 
 aliases:
-  ensembl: rattus_norvegicus
   snpeff: Rnor_5.0.75
 
 rnaseq:

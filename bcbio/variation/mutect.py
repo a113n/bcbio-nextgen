@@ -2,17 +2,19 @@
 
 from distutils.version import LooseVersion
 import os
-import re
-import shutil
+
+import toolz as tz
 
 from bcbio import bam, broad, utils
-from bcbio.utils import file_exists, get_in, open_gzipsafe, remove_safe
+from bcbio.utils import file_exists, get_in, open_gzipsafe
 from bcbio.distributed.transaction import file_transaction
-from bcbio.variation.realign import has_aligned_reads
+from bcbio.heterogeneity import chromhacks
+from bcbio.pipeline import config_utils
+from bcbio.pipeline import datadict as dd
 from bcbio.pipeline.shared import subset_variant_regions
-from bcbio.variation import bamprep, vcfutils, scalpel
+from bcbio.variation import bamprep, bedutils, vcfutils, scalpel
+from bcbio.variation.realign import has_aligned_reads
 from bcbio.variation.vcfutils import bgzip_and_index
-from bcbio.structural import pindel
 from bcbio.log import logger
 
 _PASS_EXCEPTIONS = set(["java.lang.RuntimeException: "
@@ -41,23 +43,35 @@ def _check_mutect_version(broad_runner):
                        "Java 7).")
             raise ValueError(message)
 
-def _config_params(base_config, assoc_files, region, out_file):
+def _config_params(base_config, assoc_files, region, out_file, items):
     """Add parameters based on configuration variables, associated files and genomic regions.
     """
     params = []
-    contamination = base_config["algorithm"].get("fraction_contamination", 0)
-    params += ["--fraction_contamination", contamination]
     dbsnp = assoc_files.get("dbsnp")
     if dbsnp:
         params += ["--dbsnp", dbsnp]
     cosmic = assoc_files.get("cosmic")
     if cosmic:
         params += ["--cosmic", cosmic]
-    variant_regions = base_config["algorithm"].get("variant_regions")
-    region = subset_variant_regions(variant_regions, region, out_file)
+    variant_regions = bedutils.population_variant_regions(items)
+    region = subset_variant_regions(variant_regions, region, out_file, items)
     if region:
         params += ["-L", bamprep.region_to_gatk(region), "--interval_set_rule",
                    "INTERSECTION"]
+    # set low frequency calling parameter if adjusted
+    # to set other MuTect parameters on contamination, pass options to resources for mutect
+    # --fraction_contamination --minimum_normal_allele_fraction
+    min_af = tz.get_in(["algorithm", "min_allele_fraction"], base_config)
+    if min_af:
+        params += ["--minimum_mutation_cell_fraction", "%.2f" % (min_af / 100.0)]
+    resources = config_utils.get_resources("mutect", base_config)
+    if resources.get("options") is not None:
+        params += [str(x) for x in resources.get("options", [])]
+    # Output quality scores
+    if "--enable_qscore_output" not in params:
+        params.append("--enable_qscore_output")
+    # drf not currently supported in MuTect to turn off duplicateread filter
+    # params += gatk.standard_cl_params(items)
     return params
 
 def _mutect_call_prep(align_bams, items, ref_file, assoc_files,
@@ -65,19 +79,21 @@ def _mutect_call_prep(align_bams, items, ref_file, assoc_files,
     """Preparation work for MuTect.
     """
     base_config = items[0]["config"]
+    broad_runner = broad.runner_from_path("picard", base_config)
+    broad_runner.run_fn("picard_index_ref", ref_file)
+
     broad_runner = broad.runner_from_config(base_config, "mutect")
     _check_mutect_version(broad_runner)
-
-    broad_runner.run_fn("picard_index_ref", ref_file)
     for x in align_bams:
         bam.index(x, base_config)
 
     paired = vcfutils.get_paired_bams(align_bams, items)
+    if not paired:
+        raise ValueError("Specified MuTect calling but 'tumor' phenotype not present in batch\n"
+                         "https://bcbio-nextgen.readthedocs.org/en/latest/contents/"
+                         "pipelines.html#cancer-variant-calling\n"
+                         "for samples: %s" % ", " .join([dd.get_sample_name(x) for x in items]))
     params = ["-R", ref_file, "-T", "MuTect", "-U", "ALLOW_N_CIGAR_READS"]
-    # if coverage_depth_max is not given, default to 10000
-    downsample_cov = get_in(paired.tumor_config, ("algorithm", "coverage_depth_max"), 10000)
-    # if coverage_depth_max is zero, default to Broad default value (currently 1500)
-    params += ["--downsample_to_coverage", max(1500, downsample_cov)] if downsample_cov > 0 else []
     params += ["--read_filter", "NotPrimaryAlignment"]
     params += ["-I:tumor", paired.tumor_bam]
     params += ["--tumor_sample_name", paired.tumor_name]
@@ -86,7 +102,7 @@ def _mutect_call_prep(align_bams, items, ref_file, assoc_files,
         params += ["--normal_sample_name", paired.normal_name]
     if paired.normal_panel is not None:
         params += ["--normal_panel", paired.normal_panel]
-    params += _config_params(base_config, assoc_files, region, out_file)
+    params += _config_params(base_config, assoc_files, region, out_file, items)
     return broad_runner, params
 
 def mutect_caller(align_bams, items, ref_file, assoc_files, region=None,
@@ -106,29 +122,32 @@ def mutect_caller(align_bams, items, ref_file, assoc_files, region=None,
                                    region, out_file_mutect)
         if (not isinstance(region, (list, tuple)) and
               not all(has_aligned_reads(x, region) for x in align_bams)):
-                vcfutils.write_empty_vcf(out_file)
-                return
+            paired = vcfutils.get_paired(items)
+            vcfutils.write_empty_vcf(out_file, samples=[x for x in (paired.tumor_name, paired.normal_name) if x])
+            return
         out_file_orig = "%s-orig%s" % utils.splitext_plus(out_file_mutect)
-        with file_transaction(config, out_file_orig) as tx_out_file:
-            # Rationale: MuTect writes another table to stdout, which we don't need
-            params += ["--vcf", tx_out_file, "-o", os.devnull]
-            broad_runner.run_mutect(params)
-        out_file_mutect = _rename_allelic_fraction_field(out_file_orig, config, out_file_mutect)
-        indelcaller = vcfutils.get_indelcaller(base_config)
+        if not file_exists(out_file_orig):
+            with file_transaction(config, out_file_orig) as tx_out_file:
+                # Rationale: MuTect writes another table to stdout, which we don't need
+                params += ["--vcf", tx_out_file, "-o", os.devnull]
+                broad_runner.run_mutect(params)
         is_paired = "-I:normal" in params
-        if "scalpel" in indelcaller.lower():
+        if not utils.file_uptodate(out_file_mutect, out_file_orig):
+            out_file_mutect = _fix_mutect_output(out_file_orig, config, out_file_mutect, is_paired)
+        indelcaller = vcfutils.get_indelcaller(base_config)
+        if ("scalpel" in indelcaller.lower() and region and isinstance(region, (tuple, list))
+              and chromhacks.is_autosomal_or_sex(region[0])):
             # Scalpel InDels
             out_file_indels = (out_file.replace(".vcf", "-somaticIndels.vcf")
                                if "vcf" in out_file else out_file + "-somaticIndels.vcf")
             if scalpel.is_installed(items[0]["config"]):
-                with file_transaction(config, out_file_indels) as tx_out_file2:
-                    if not is_paired:
-                        vcfutils.check_paired_problems(items)
-                        scalpel._run_scalpel_caller(align_bams, items, ref_file, assoc_files,
-                                                    region=region, out_file=tx_out_file2)
-                    else:
-                        scalpel._run_scalpel_paired(align_bams, items, ref_file, assoc_files,
-                                                    region=region, out_file=tx_out_file2)
+                if not is_paired:
+                    vcfutils.check_paired_problems(items)
+                    scalpel._run_scalpel_caller(align_bams, items, ref_file, assoc_files,
+                                                region=region, out_file=out_file_indels)
+                else:
+                    scalpel._run_scalpel_paired(align_bams, items, ref_file, assoc_files,
+                                                region=region, out_file=out_file_indels)
                 out_file = vcfutils.combine_variant_files(orig_files=[out_file_mutect, out_file_indels],
                                                           out_file=out_file,
                                                           ref_file=items[0]["sam_ref"],
@@ -137,6 +156,7 @@ def mutect_caller(align_bams, items, ref_file, assoc_files, region=None,
             else:
                 utils.symlink_plus(out_file_mutect, out_file)
         elif "pindel" in indelcaller.lower():
+            from bcbio.structural import pindel
             out_file_indels = (out_file.replace(".vcf", "-somaticIndels.vcf")
                                if "vcf" in out_file else out_file + "-somaticIndels.vcf")
             if pindel.is_installed(items[0]["config"]):
@@ -180,12 +200,7 @@ def _SID_call_prep(align_bams, items, ref_file, assoc_files, region=None, out_fi
     # can no more 10000 new reads begin.
     # Further, limit maxNumberOfReads accordingly, otherwise SID discards
     # windows for high coverage panels.
-    window_size = 200  # default SID value
     paired = vcfutils.get_paired_bams(align_bams, items)
-    max_depth = min(max(200, get_in(paired.tumor_config,
-                                    ("algorithm", "coverage_depth_max"), 10000)), 10000)
-    params += ["--downsample_to_coverage", max_depth]
-    params += ["--maxNumberOfReads", str(int(max_depth) * window_size)]
     params += ["--read_filter", "NotPrimaryAlignment"]
     params += ["-I:tumor", paired.tumor_bam]
     min_af = float(get_in(paired.tumor_config, ("algorithm", "min_allele_fraction"), 10)) / 100.0
@@ -201,18 +216,30 @@ def _SID_call_prep(align_bams, items, ref_file, assoc_files, region=None, out_fi
                    "INTERSECTION"]
     return params
 
-def _rename_allelic_fraction_field(orig_file, config, out_file):
-    """Rename allelic fraction field in mutect output
-       from FA to FREQ to standarize with other tools
+def _fix_mutect_output(orig_file, config, out_file, is_paired):
+    """Adjust MuTect output to match other callers.
+
+    - Rename allelic fraction field in mutect output from FA to FREQ to standarize with other tools
+    - Remove extra 'none' samples introduced when calling tumor-only samples
     """
     out_file_noc = out_file.replace(".vcf.gz", ".vcf")
+    none_index = -1
     with file_transaction(config, out_file_noc) as tx_out_file:
         with open_gzipsafe(orig_file) as in_handle:
             with open(tx_out_file, 'w') as out_handle:
                 for line in in_handle:
-                    if line.startswith("##FORMAT=<ID=FA"):
+                    if not is_paired and line.startswith("#CHROM"):
+                        parts = line.rstrip().split("\t")
+                        none_index = parts.index("none")
+                        del parts[none_index]
+                        line = "\t".join(parts) + "\n"
+                    elif line.startswith("##FORMAT=<ID=FA"):
                         line = line.replace("=FA", "=FREQ")
-                    if not line.startswith("#"):
+                    elif not line.startswith("#"):
+                        if none_index > 0:
+                            parts = line.rstrip().split("\t")
+                            del parts[none_index]
+                            line = "\t".join(parts) + "\n"
                         line = line.replace("FA", "FREQ")
                     out_handle.write(line)
     return bgzip_and_index(out_file_noc, config)

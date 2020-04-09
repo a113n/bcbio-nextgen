@@ -1,5 +1,6 @@
 """Helpful utilities for building analysis pipelines.
 """
+import glob
 import gzip
 import os
 import tempfile
@@ -9,14 +10,18 @@ import contextlib
 import itertools
 import functools
 import random
-import ConfigParser
-import collections
 import fnmatch
 import subprocess
-import zlib
+import sys
+import types
 
+import six
 import toolz as tz
 import yaml
+
+from collections import Mapping, OrderedDict
+
+
 try:
     from concurrent import futures
 except ImportError:
@@ -24,98 +29,6 @@ except ImportError:
         import futures
     except ImportError:
         futures = None
-
-# ## S3 interaction
-
-SUPPORTED_REMOTES = ("s3://",)
-
-def s3_bucket_key(fname):
-    return fname.split("//")[-1].split("/", 1)
-
-def dl_remotes(fname, input_dir, dl_dir=None):
-    if fname.startswith("s3://"):
-        from bcbio.distributed.transaction import file_transaction
-        bucket, key = s3_bucket_key(fname)
-        if not dl_dir:
-            dl_dir = safe_makedir(os.path.join(input_dir, bucket, os.path.dirname(key)))
-        out_file = os.path.join(dl_dir, os.path.basename(key))
-        if not file_exists(out_file):
-            with file_transaction({}, out_file) as tx_out_file:
-                cmd = ["gof3r", "get", "--no-md5", "-k", key, "-b", bucket, "-p", tx_out_file]
-                subprocess.check_call(cmd)
-        return out_file
-    else:
-        return fname
-
-def remote_cl_input(fname):
-    """Return command line input for a file, handling streaming remote cases.
-    """
-    if not fname:
-        return fname
-    elif fname.startswith("s3://"):
-        bucket, key = s3_bucket_key(fname)
-        gunzip = "| gunzip -c" if fname.endswith(".gz") else ""
-        return "<(gof3r get --no-md5 -k {key} -b {bucket} {gunzip})".format(**locals())
-    else:
-        return fname
-
-def s3_handle(fname):
-    """Return a handle like object for streaming from S3.
-    """
-    import boto
-
-    class S3Handle:
-        def __init__(self, key):
-            self._key = key
-            self._iter = self._line_iter()
-        def _line_iter(self):
-            """From mrjob: https://github.com/Yelp/mrjob/blob/master/mrjob/util.py
-            """
-            buf = ""
-            search_offset = 0
-            for chunk in self._chunk_iter():
-                buf += chunk
-                start = 0
-                while True:
-                    end = buf.find("\n", start + search_offset) + 1
-                    if end:  # if find() returned -1, end would be 0
-                        yield buf[start:end]
-                        start = end
-                        # reset the search offset
-                        search_offset = 0
-                    else:
-                        # this will happen eventually
-                        buf = buf[start:]
-                        # set search offset so we do not need to scan this part of the buffer again
-                        search_offset = len(buf)
-                        break
-                if buf:
-                    yield buf + '\n'
-        def _chunk_iter(self):
-            dec = zlib.decompressobj(16 | zlib.MAX_WBITS) if self._key.name.endswith(".gz") else None
-            for chunk in self._key:
-                if dec:
-                    chunk = dec.decompress(chunk)
-                if chunk:
-                    yield chunk
-        def __enter__(self):
-            return self
-        def __exit__(self, *args):
-            self.close()
-        def __iter__(self):
-            return self
-        def read(self, size):
-            return self._key.read(size)
-        def next(self):
-            return self._iter.next()
-        def close(self):
-            self._key.close(fast=True)
-
-    bucket, key = s3_bucket_key(fname)
-    s3 = boto.connect_s3()
-    s3b = s3.get_bucket(bucket)
-    s3key = s3b.get_key(key)
-    return S3Handle(s3key)
 
 @contextlib.contextmanager
 def cpmap(cores=1):
@@ -139,7 +52,7 @@ def map_wrap(f):
     """
     @functools.wraps(f)
     def wrapper(*args, **kwargs):
-        return apply(f, *args, **kwargs)
+        return f(*args, **kwargs)
     return wrapper
 
 def transform_to(ext):
@@ -233,6 +146,32 @@ def memoize_outfile(ext=None, stem=None):
     if stem:
         return filter_to(stem)
 
+def to_single_data(input):
+    """Convert an input to a single bcbio data/world object.
+
+    Handles both single sample cases (CWL) and all sample cases (standard bcbio).
+    """
+    if (isinstance(input, (list, tuple)) and len(input) == 1):
+        return input[0]
+    else:
+        assert isinstance(input, dict), input
+        return input
+
+def unpack_worlds(items):
+    """Handle all the ways we can pass multiple samples for back-compatibility.
+    """
+    # Unpack nested lists of samples grouped together (old IPython style)
+    if isinstance(items[0], (list, tuple)) and len(items[0]) == 1:
+        out = []
+        for d in items:
+            assert len(d) == 1 and isinstance(d[0], dict), len(d)
+            out.append(d[0])
+    # Unpack a single argument with multiple samples (CWL style)
+    elif isinstance(items, (list, tuple)) and len(items) == 1 and isinstance(items[0], (list, tuple)):
+        out = items[0]
+    else:
+        out = items
+    return out
 
 def safe_makedir(dname):
     """Make a directory if it doesn't exist, handling concurrent race conditions.
@@ -259,7 +198,18 @@ def chdir(new_dir):
 
     http://lucentbeing.com/blog/context-managers-and-the-with-statement-in-python/
     """
-    cur_dir = os.getcwd()
+    # On busy filesystems can have issues accessing main directory. Allow retries
+    num_tries = 0
+    max_tries = 5
+    cur_dir = None
+    while cur_dir is None:
+        try:
+            cur_dir = os.getcwd()
+        except OSError:
+            if num_tries > max_tries:
+                raise
+            num_tries += 1
+            time.sleep(2)
     safe_makedir(new_dir)
     os.chdir(new_dir)
     try:
@@ -279,14 +229,6 @@ def tmpfile(*args, **kwargs):
         if os.path.exists(fname):
             os.remove(fname)
 
-def file_exists_or_remote(fname):
-    """Check if a file exists or is accessible remotely.
-    """
-    if fname.startswith(SUPPORTED_REMOTES):
-        return True
-    else:
-        return file_exists(fname)
-
 def file_exists(fname):
     """Check if a file exists and is non-empty.
     """
@@ -294,6 +236,17 @@ def file_exists(fname):
         return fname and os.path.exists(fname) and os.path.getsize(fname) > 0
     except OSError:
         return False
+
+
+def get_size(path):
+    """ Returns the size in bytes if `path` is a file,
+        or the size of all files in `path` if it's a directory.
+        Analogous to `du -s`.
+    """
+    if os.path.isfile(path):
+        return os.path.getsize(path)
+    return sum(get_size(os.path.join(path, f)) for f in os.listdir(path))
+
 
 def file_uptodate(fname, cmp_fname):
     """Check if a file exists, is non-empty and is more recent than cmp_fname.
@@ -318,14 +271,16 @@ def save_diskspace(fname, reason, config):
     disk by replacing them with a short message.
     """
     if config["algorithm"].get("save_diskspace", False):
-        with open(fname, "w") as out_handle:
-            out_handle.write("File removed to save disk space: %s" % reason)
+        for ext in ["", ".bai"]:
+            if os.path.exists(fname + ext):
+                with open(fname + ext, "w") as out_handle:
+                    out_handle.write("File removed to save disk space: %s" % reason)
 
 def read_galaxy_amqp_config(galaxy_config, base_dir):
     """Read connection information on the RabbitMQ server from Galaxy config.
     """
     galaxy_config = add_full_path(galaxy_config, base_dir)
-    config = ConfigParser.ConfigParser()
+    config = six.moves.configparser.ConfigParser()
     config.read(galaxy_config)
     amqp_config = {}
     for option in config.options("galaxy_amqp"):
@@ -350,9 +305,23 @@ def splitext_plus(f):
 
 def remove_safe(f):
     try:
-        os.remove(f)
+        if os.path.isdir(f):
+            shutil.rmtree(f)
+        else:
+            os.remove(f)
     except OSError:
         pass
+
+def move_safe(origin, target):
+    """
+    Move file, skip if exists
+    """
+    if origin == target:
+        return origin
+    if file_exists(target):
+        return target
+    shutil.move(origin, target)
+    return target
 
 def file_plus_index(fname):
     """Convert a file name into the file plus required indexes.
@@ -365,27 +334,62 @@ def file_plus_index(fname):
     else:
         return [fname]
 
-def symlink_plus(orig, new):
-    """Create relative symlinks and handle associated biological index files.
+def remove_plus(orig):
+    """Remove a fils, including biological index files.
+    """
+    for ext in ["", ".idx", ".gbi", ".tbi", ".bai"]:
+        if os.path.exists(orig + ext):
+            remove_safe(orig + ext)
+
+def copy_plus(orig, new):
+    """Copy a fils, including biological index files.
     """
     for ext in ["", ".idx", ".gbi", ".tbi", ".bai"]:
         if os.path.exists(orig + ext) and (not os.path.lexists(new + ext) or not os.path.exists(new + ext)):
+            shutil.copyfile(orig + ext, new + ext)
+
+def symlink_plus(orig, new):
+    """Create relative symlinks and handle associated biological index files.
+    """
+    orig = os.path.abspath(orig)
+    if not os.path.exists(orig):
+        raise RuntimeError("File not found: %s" % orig)
+    for ext in ["", ".idx", ".gbi", ".tbi", ".bai", ".fai"]:
+        if os.path.exists(orig + ext) and (not os.path.lexists(new + ext) or not os.path.exists(new + ext)):
             with chdir(os.path.dirname(new)):
                 remove_safe(new + ext)
-                os.symlink(os.path.relpath(orig + ext), os.path.basename(new + ext))
-                # Work around symlink issues on some filesystems. Randomly fail to symlink.
-                if not os.path.exists(new + ext) or not os.path.lexists(new + ext):
-                    remove_safe(new + ext)
-                    shutil.copyfile(orig + ext, new + ext)
+                # Work around symlink issues on some filesystems. Randomly
+                # fail to symlink.
+                try:
+                    os.symlink(os.path.relpath(orig + ext), os.path.basename(new + ext))
+                except OSError:
+                    if not os.path.exists(new + ext) or not os.path.lexists(new + ext):
+                        remove_safe(new + ext)
+                        shutil.copyfile(orig + ext, new + ext)
     orig_noext = splitext_plus(orig)[0]
     new_noext = splitext_plus(new)[0]
-    for sub_ext in [".bai"]:
+    for sub_ext in [".bai", ".dict"]:
         if os.path.exists(orig_noext + sub_ext) and not os.path.lexists(new_noext + sub_ext):
             with chdir(os.path.dirname(new_noext)):
                 os.symlink(os.path.relpath(orig_noext + sub_ext), os.path.basename(new_noext + sub_ext))
 
-def open_gzipsafe(f):
-    return gzip.open(f) if f.endswith(".gz") else open(f)
+def open_gzipsafe(f, is_gz=False):
+    if f.endswith(".gz") or is_gz:
+        if six.PY3:
+            return gzip.open(f, "rt", encoding="utf-8", errors="ignore")
+        else:
+            return gzip.open(f)
+    else:
+        if six.PY3:
+            return open(f, encoding="utf-8", errors="ignore")
+        else:
+            return open(f)
+
+def is_empty_gzipsafe(f):
+    h = open_gzipsafe(f)
+    is_empty = len(h.read(1)) > 0
+    h.close()
+    return is_empty
 
 def append_stem(to_transform, word):
     """
@@ -403,7 +407,6 @@ def append_stem(to_transform, word):
     else:
         raise ValueError("append_stem takes a single filename as a string or "
                          "a list of filenames to transform.")
-
 
 def replace_suffix(to_transform, suffix):
     """
@@ -438,11 +441,34 @@ def partition_all(n, iterable):
             break
         yield chunk
 
-def partition(pred, iterable):
+def robust_partition_all(n, iterable):
+    """
+    replaces partition_all with a more robust version.
+    Workaround for a segfault in pybedtools when using a BedTool as an iterator:
+    https://github.com/daler/pybedtools/issues/88 for the discussion
+    """
+    it = iter(iterable)
+    while True:
+        x = []
+        for _ in range(n):
+            try:
+                x.append(next(it))
+            except StopIteration:
+                yield x
+                # Omitting this StopIteration results in a segfault!
+                raise StopIteration
+        yield x
+
+def partition(pred, iterable, tolist=False):
     'Use a predicate to partition entries into false entries and true entries'
     # partition(is_odd, range(10)) --> 0 2 4 6 8   and  1 3 5 7 9
     t1, t2 = itertools.tee(iterable)
-    return itertools.ifilterfalse(pred, t1), itertools.ifilter(pred, t2)
+    ifalse = six.moves.filterfalse(pred, t1)
+    itrue = six.moves.filter(pred, t2)
+    if tolist:
+        return list(ifalse), list(itrue)
+    else:
+        return ifalse, itrue
 
 # ## Dealing with configuration files
 
@@ -451,12 +477,12 @@ def merge_config_files(fnames):
     """
     def _load_yaml(fname):
         with open(fname) as in_handle:
-            config = yaml.load(in_handle)
+            config = yaml.safe_load(in_handle)
         return config
     out = _load_yaml(fnames[0])
     for fname in fnames[1:]:
         cur = _load_yaml(fname)
-        for k, v in cur.iteritems():
+        for k, v in cur.items():
             if k in out and isinstance(out[k], dict):
                 out[k].update(v)
             else:
@@ -470,7 +496,7 @@ def deepish_copy(org):
     http://writeonly.wordpress.com/2009/05/07/deepcopy-is-a-pig-for-simple-data/
     """
     out = dict().fromkeys(org)
-    for k, v in org.iteritems():
+    for k, v in org.items():
         if isinstance(v, dict):
             out[k] = deepish_copy(v)
         else:
@@ -482,6 +508,19 @@ def deepish_copy(org):
                 except TypeError:
                     out[k] = v      # ints
     return out
+
+def safe_to_float(x):
+    """Convert to float, handling None and non-float inputs.
+
+    Useful for cleaning complicated output from variant callers.
+    """
+    if x is None:
+        return None
+    else:
+        try:
+            return float(x)
+        except ValueError:
+            return None
 
 def get_in(d, t, default=None):
     """
@@ -501,8 +540,7 @@ def flatten(l):
 
     """
     for el in l:
-        if isinstance(el, collections.Iterable) and not isinstance(el,
-                                                                   basestring):
+        if isinstance(el, (list, tuple)):
             for sub in flatten(el):
                 yield sub
         else:
@@ -517,9 +555,9 @@ def is_sequence(arg):
     example: arg("lol") -> False
 
     """
-    return (not hasattr(arg, "strip") and
-            hasattr(arg, "__getitem__") or
-            hasattr(arg, "__iter__"))
+    return (not is_string(arg) and
+            (hasattr(arg, "__getitem__") or
+             hasattr(arg, "__iter__")))
 
 
 def is_pair(arg):
@@ -530,7 +568,7 @@ def is_pair(arg):
     return is_sequence(arg) and len(arg) == 2
 
 def is_string(arg):
-    return isinstance(arg, basestring)
+    return isinstance(arg, six.string_types)
 
 
 def locate(pattern, root=os.curdir):
@@ -598,8 +636,11 @@ def replace_directory(out_files, dest_dir):
         raise ValueError("in_files must either be a sequence of filenames "
                          "or a string")
 
-def which(program):
+
+def which(program, env=None):
     """ returns the path to an executable or None if it can't be found"""
+    if env is None:
+        env = os.environ.copy()
 
     def is_exe(fpath):
         return os.path.isfile(fpath) and os.access(fpath, os.X_OK)
@@ -609,11 +650,14 @@ def which(program):
         if is_exe(program):
             return program
     else:
-        for path in os.environ["PATH"].split(os.pathsep):
+        for path in env["PATH"].split(os.pathsep):
             exe_file = os.path.join(path, program)
             if is_exe(exe_file):
                 return exe_file
-
+    for path in get_all_conda_bins():
+        exe_file = os.path.join(path, program)
+        if is_exe(exe_file):
+            return exe_file
     return None
 
 def reservoir_sample(stream, num_items, item_parser=lambda x: x):
@@ -645,16 +689,42 @@ def dictapply(d, fn):
             d[k] = fn(v)
     return d
 
+def Rscript_cmd():
+    """Retrieve path to locally installed Rscript or first in PATH.
+
+    Prefers Rscript version installed via conda to a system version.
+    """
+    rscript = which(os.path.join(get_bcbio_bin(), "Rscript"))
+    if rscript:
+        return rscript
+    else:
+        return which("Rscript")
+
+def R_sitelib(env="base"):
+    """Retrieve the R site-library installed with the bcbio installer for a given
+    environment. Defaults to the base environment.
+    """
+    if env == "base":
+        return os.path.join(os.path.dirname(get_bcbio_bin()), "lib", "R", "library")
+    else:
+        conda_dir = get_conda_dir()
+        sitelib = os.path.join(conda_dir, "envs", env, "lib", "R", "library")
+        if not os.path.exists(sitelib):
+            raise OSError("The {env} environment does not have R installed.")
+        return sitelib
+
 def R_package_path(package):
     """
     return the path to an installed R package
     """
-    cmd = "Rscript -e 'find.package(\"{package}\")'"
+    local_sitelib = R_sitelib()
+    rscript = Rscript_cmd()
+    cmd = """{rscript} --vanilla -e '.libPaths(c("{local_sitelib}")); find.package("{package}")'"""
     try:
         output = subprocess.check_output(cmd.format(**locals()), shell=True)
-    except subprocess.CalledProcessError, e:
+    except subprocess.CalledProcessError as e:
         return None
-    for line in output.split("\n"):
+    for line in output.decode().split("\n"):
         if "[1]" not in line:
             continue
         dirname = line.split("[1]")[1].replace("\"", "").strip()
@@ -662,9 +732,192 @@ def R_package_path(package):
             return dirname
     return None
 
+def R_package_resource(package, resource):
+    """
+    return a path to an R package resource, if it is available
+    """
+    package_path = R_package_path(package)
+    if not package_path:
+        return None
+    package_resource = os.path.join(package_path, resource)
+    if not file_exists(package_resource):
+        return None
+    else:
+        return package_resource
+
+def get_java_binpath(cmd=None):
+    """Retrieve path for java to use, handling custom BCBIO_JAVA_HOME
+
+    Defaults to the dirname of cmd, or local anaconda directory
+    """
+    if os.environ.get("BCBIO_JAVA_HOME"):
+        test_cmd = os.path.join(os.environ["BCBIO_JAVA_HOME"], "bin", "java")
+        if os.path.exists(test_cmd):
+            cmd = test_cmd
+    if not cmd:
+        cmd = Rscript_cmd()
+    return os.path.dirname(cmd)
+
+def clear_java_home():
+    """Clear JAVA_HOME environment or reset to BCBIO_JAVA_HOME.
+
+    Avoids accidental java injection but respects custom BCBIO_JAVA_HOME
+    command.
+    """
+    if os.environ.get("BCBIO_JAVA_HOME"):
+        test_cmd = os.path.join(os.environ["BCBIO_JAVA_HOME"], "bin", "java")
+        if os.path.exists(test_cmd):
+            return "export JAVA_HOME=%s" % os.environ["BCBIO_JAVA_HOME"]
+    return "unset JAVA_HOME"
+
+def get_java_clprep(cmd=None):
+    """Correctly prep command line for java commands, setting PATH and unsetting JAVA_HOME.
+    """
+    return "%s && export PATH=%s:\"$PATH\"" % (clear_java_home(), get_java_binpath(cmd))
+
+def get_R_exports(env="base"):
+    if env == "base":
+        rpath = os.path.dirname(Rscript_cmd())
+    else:
+        conda_dir = get_conda_dir()
+        rpath = os.path.join(conda_dir, "envs", env, "bin")
+    return f"unset R_HOME && unset R_LIBS && export PATH={rpath}:\"$PATH\""
+
+def perl_cmd():
+    """Retrieve path to locally installed conda Perl or first in PATH.
+    """
+    perl = which(os.path.join(get_bcbio_bin(), "perl"))
+    if perl:
+        return perl
+    else:
+        return which("perl")
+
+def get_perl_exports(tmpdir=None):
+    """Environmental exports to use conda installed perl.
+    """
+    perl_path = os.path.dirname(perl_cmd())
+    out = "unset PERL5LIB && export PATH=%s:\"$PATH\"" % (perl_path)
+    if tmpdir:
+        out += " && export TMPDIR=%s" % (tmpdir)
+    return out
+
+
+def get_bcbio_env():
+    env = os.environ.copy()
+    env["PATH"] = append_path(get_bcbio_bin(), env['PATH'])
+    return env
+
+
+def append_path(bin, path, at_start=True):
+    if at_start:
+        tmpl = "{bin}:{path}"
+    else:
+        tmpl = "{path}:{bin}"
+    return tmpl.format(bin=bin, path=path)
+
+
+def get_bcbio_bin():
+    return os.path.dirname(os.path.realpath(sys.executable))
+
+def get_conda_dir():
+    bcbio_bin = get_bcbio_bin()
+    return os.path.dirname(bcbio_bin)
+
+def get_all_conda_bins():
+    """Retrieve all possible conda bin directories, including environments.
+    """
+    conda_dir = get_conda_dir()
+    if os.path.join("anaconda", "envs") in conda_dir:
+        conda_dir = os.path.join(conda_dir[:conda_dir.rfind(os.path.join("anaconda", "envs"))], "anaconda")
+    return [bcbio_bin] + list(glob.glob(os.path.join(conda_dir, "envs", "*", "bin")))
+
+def get_program_python(cmd):
+    """Get the full path to a python version linked to the command.
+
+    Allows finding python based programs in python 2 versus python 3
+    environments.
+    """
+    full_cmd = os.path.realpath(which(cmd))
+    cmd_python = os.path.join(os.path.dirname(full_cmd), "python")
+    env_python = None
+    if "envs" in cmd_python:
+        parts = cmd_python.split(os.sep)
+        env_python = os.path.join(os.sep.join(parts[:parts.index("envs") + 2]), "bin", "python")
+    if os.path.exists(cmd_python):
+        return cmd_python
+    elif env_python and os.path.exists(env_python):
+        return env_python
+    else:
+        return os.path.realpath(sys.executable)
+
+def local_path_export(at_start=True, env_cmd=None):
+    """Retrieve paths to local install, also including environment paths if env_cmd included.
+    """
+    paths = [get_bcbio_bin()]
+    if env_cmd:
+        env_path = os.path.dirname(get_program_python(env_cmd))
+        if env_path not in paths:
+            paths.insert(0, env_path)
+    if at_start:
+        return "export PATH=%s:\"$PATH\" && " % (":".join(paths))
+    else:
+        return "export PATH=\"$PATH\":%s && " % (":".join(paths))
+
+def locale_export():
+    """Exports for dealing with Click-based programs and ASCII/Unicode errors.
+
+    RuntimeError: Click will abort further execution because Python 3 was
+    configured to use ASCII as encoding for the environment.
+    Consult https://click.palletsprojects.com/en/7.x/python3/ for mitigation steps.
+    """
+    locale_to_use = get_locale()
+    return "export LC_ALL=%s && export LANG=%s && " % (locale_to_use, locale_to_use)
+
+def get_locale():
+    """
+    Looks up available locales on the system to find an appropriate one to pick,
+    defaulting to C.UTF-8 which is globally available on newer systems. Prefers
+    C.UTF-8 and en_US encodings, if available
+    """
+    default_locale = "C.UTF-8"
+    preferred_locales = {"c.utf-8", "c.utf8", "en_us.utf-8", "en_us.utf8"}
+    locale_to_use = None
+    try:
+        locales = subprocess.check_output(["locale", "-a"]).decode(errors="ignore").split("\n")
+    except subprocess.CalledProcessError:
+        locales = []
+    # check for preferred locale
+    for locale in locales:
+        if locale.lower() in preferred_locales:
+            locale_to_use = locale
+            break
+    # if preferred locale not available take first UTF-8 locale
+    if not locale_to_use:
+        for locale in locales:
+            if locale.lower().endswith(("utf-8", "utf8")):
+                locale_to_use = locale
+                break
+    # if locale listing not available, try using the default locale
+    if not locale_to_use:
+        locale_to_use = default_locale
+    return locale_to_use
+
+def java_freetype_fix():
+    """Provide workaround for issues FreeType library symbols.
+
+    libfontconfig.so.1: undefined symbol: FT_Done_MM_Var
+
+    Cheap workaround with LD_PRELOAD, I don't know a better one.
+    """
+    return "export LD_PRELOAD=%s/lib/libfreetype.so && " % os.path.dirname(get_bcbio_bin())
+
 def is_gzipped(fname):
     _, ext = os.path.splitext(fname)
     return ext in [".gz", "gzip"]
+
+def is_bzipped(fname):
+    _, ext = os.path.splitext(fname)
+    return ext in [".bz2", "bzip2"]
 
 def open_possible_gzip(fname, flag="r"):
     if is_gzipped(fname):
@@ -673,3 +926,106 @@ def open_possible_gzip(fname, flag="r"):
         return gzip.open(fname, flag)
     else:
         return open(fname, flag)
+
+def filter_missing(xs):
+    """
+    remove items from a list if they evaluate to False
+    """
+    return filter(lambda x: x, xs)
+
+def rbind(dfs):
+    """
+    acts like rbind for pandas dataframes
+    """
+    if len(dfs) == 1:
+        return dfs[0]
+    df = dfs[0]
+    for d in dfs[1:]:
+        df = df.append(d)
+    return df
+
+def max_command_length():
+    """
+    get the maximum length of the command line, in bytes, defaulting
+    to a conservative number if not set
+    http://www.in-ulm.de/~mascheck/various/argmax/
+    """
+    DEFAULT_MAX_LENGTH = 150000 # lowest seen so far is 200k
+    try:
+        arg_max = os.sysconf('SC_ARG_MAX')
+        env_lines = len(os.environ) * 4
+        env_chars = sum([len(x) + len(y) for x, y in os.environ.items()])
+        arg_length = arg_max - env_lines - 2048
+    except ValueError:
+        arg_length = DEFAULT_MAX_LENGTH
+    return arg_length if arg_length > 0 else DEFAULT_MAX_LENGTH
+
+
+def get_abspath(path, pardir=None):
+    if pardir is None:
+        pardir = os.getcwd()
+    path = os.path.expandvars(path)
+    return os.path.normpath(os.path.join(pardir, path))
+
+def sort_filenames(filenames):
+    """
+    sort a list of files by filename only, ignoring the directory names
+    """
+    basenames = [os.path.basename(x) for x in filenames]
+    indexes = [i[0] for i in sorted(enumerate(basenames), key=lambda x:x[1])]
+    return [filenames[x] for x in indexes]
+
+# LazyImport from NIPY
+# https://github.com/nipy/nitime/blob/master/nitime/lazyimports.py
+
+class LazyImport(types.ModuleType):
+    """
+    This class takes the module name as a parameter, and acts as a proxy for
+    that module, importing it only when the module is used, but effectively
+    acting as the module in every other way (including inside IPython with
+    respect to introspection and tab completion) with the *exception* of
+    reload()- reloading a :class:`LazyImport` raises an :class:`ImportError`.
+    >>> mlab = LazyImport('matplotlib.mlab')
+    No import happens on the above line, until we do something like call an
+    ``mlab`` method or try to do tab completion or introspection on ``mlab``
+    in IPython.
+    >>> mlab
+    <module 'matplotlib.mlab' will be lazily loaded>
+    Now the :class:`LazyImport` will do an actual import, and call the dist
+    function of the imported module.
+    >>> mlab.dist(1969,2011)
+    42.0
+    """
+    def __getattribute__(self, x):
+        # This method will be called only once, since we'll change
+        # self.__class__ to LoadedLazyImport, and __getattribute__ will point
+        # to module.__getattribute__
+        name = object.__getattribute__(self, '__name__')
+        __import__(name)
+        # if name above is 'package.foo.bar', package is returned, the docs
+        # recommend that in order to get back the full thing, that we import
+        # and then lookup the full name is sys.modules, see:
+        # http://docs.python.org/library/functions.html#__import__
+        module = sys.modules[name]
+        # Now that we've done the import, cutout the middleman and make self
+        # act as the imported module
+        class LoadedLazyImport(types.ModuleType):
+            __getattribute__ = module.__getattribute__
+            __repr__ = module.__repr__
+        object.__setattr__(self, '__class__', LoadedLazyImport)
+        # The next line will make "reload(l)" a silent no-op
+        # sys.modules[name] = self
+        return module.__getattribute__(x)
+    def __repr__(self):
+        return "<module '%s' will be lazily loaded>" %\
+                object.__getattribute__(self,'__name__')
+
+def walk_json(d, func):
+    """ Walk over a parsed JSON nested structure `d`, apply `func` to each leaf element and replace it with result
+    """
+    if isinstance(d, Mapping):
+        return OrderedDict((k, walk_json(v, func)) for k, v in d.items())
+    elif isinstance(d, list):
+        return [walk_json(v, func) for v in d]
+    else:
+        return func(d)
