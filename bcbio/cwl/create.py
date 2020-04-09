@@ -706,7 +706,7 @@ def _remove_remote_prefix(f):
     return f.split(":")[-1].split("/", 1)[1] if objectstore.is_remote(f) else f
 
 def _index_blacklist(xs):
-    blacklist = ["-resources.yaml"]
+    blacklist = []
     return [x for x in xs if not any([x.find(b) >=0 for b in blacklist])]
 
 def _to_cwlfile_with_indexes(val, get_retriever):
